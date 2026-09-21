@@ -1,0 +1,386 @@
+# ----------------------------------------------------------------------
+# landscape-change-detection-pipeline — example configuration
+#
+# Copy this file to configs/config.yaml, fill in the CHANGE_ME and
+# dollar-brace-VAR placeholders, and point the pipeline at it via --config or
+# the LANDSCAPE_CHANGE_DETECTION_CONFIG environment variable. dollar-brace-VAR placeholders
+# are substituted from the environment or a .env file (see .env.example).
+#
+# This is scaffolding: sections are added here
+# (tiles, dem, scene_download, features, split, model, train, ...) following
+# the pattern documented in src/landscape_change_detection_pipeline/config.py.
+# ----------------------------------------------------------------------
+
+# ----------------------------------------------------------------------
+# Paths
+# All of these must be set to real locations on your machine
+# None of these are pipeline parameters.
+# ----------------------------------------------------------------------
+paths:
+  data_root: ${DATA_ROOT}       # root for downloaded raw data (tiles, DEM, scenes)
+  output_root: ${OUTPUT_ROOT}   # root for pipeline outputs (inference maps, composites, stats)
+  model_root: ${MODEL_ROOT}     # root for trained model checkpoints
+
+# ----------------------------------------------------------------------
+# Google Earth Engine
+# ----------------------------------------------------------------------
+gee:
+  project: ${EE_PROJECT}
+  # Full pool of Earth Engine Cloud projects available for quota spreading.
+  # Any step that can spread
+  # work across multiple GEE projects defaults to round-robining over this
+  # pool when its own per-step project list (e.g. scene_download.ee_projects)
+  # is left empty -- list your projects once, here.
+  projects: []                         # e.g. [my-project-1, my-project-2, ...]
+
+# ----------------------------------------------------------------------
+# AOI tiling
+# ----------------------------------------------------------------------
+tiles:
+  aoi_path: CHANGE_ME                  # path to your AOI GeoPackage
+  aoi_layer: output
+  aoi_crs: EPSG:26910
+  tile_size_m: 8000.0        # square tile side, before buffering (metres)
+  buffer_m: 250.0            # edge buffer added to each tile's analysis window (metres)
+  pilot_bbox: null           # optional [minx, miny, maxx, maxy] in aoi_crs, to restrict to a pilot sub-area
+  # Prepended to every generated tile_id ("tile_0000_0000" -> "<prefix>_tile_0000_0000").
+  # tile_id is just a row/col index into YOUR OWN AOI grid -- two people tiling
+  # different AOIs will independently produce the same tile_0000_0000, which
+  # silently collides (one overwrites the other) the moment training caches are
+  # merged into a shared data/train_cache/. Set this to something unique per
+  # contributor/project (e.g. your initials) BEFORE running 01_build_tiles.py if
+  # you ever intend to share/merge training data -- it cannot be changed after
+  # the fact without redoing every downstream stage.
+  tile_id_prefix: ""                   # e.g. "projectA"
+  registry_path: data/tiles/tile_registry.parquet
+  n_splits: 1                # number of parallel GEE projects/workers to distribute tiles across
+  split_assignment_path: data/tiles/split_assignment.parquet
+
+# ----------------------------------------------------------------------
+# Per-tile DEM acquisition
+# ----------------------------------------------------------------------
+dem:
+  tile_dir: data/tiles                 # holds <tile_id>.zarr, one per tile
+  use_copernicus_fallback: true        # fall back to Copernicus GLO-30 if MRDEM-30 has no coverage
+  force_copernicus: false              # debug/test switch: skip MRDEM entirely
+
+# ----------------------------------------------------------------------
+# GEE scene search/download
+# AOI filtering reuses tiles.aoi_path/aoi_layer/aoi_crs above; a scene is
+# searched per tile window, not globally.
+# ----------------------------------------------------------------------
+scene_download:
+  date_start_mmdd: "01-01"             # whole-year coverage by default (not a fixed season)
+  date_end_mmdd: "12-31"
+  max_cloud_pct: 30.0                  # per-sensor cloud property: CLOUD_COVER (Landsat) / CLOUDY_PIXEL_PERCENTAGE (Sentinel-2)
+  max_scenes_per_tile_month: null      # cap on scenes kept per sensor per tile per calendar month; null = unlimited
+  min_aoi_coverage_pct: 75.0           # reject scenes whose footprint covers less than this % of the tile's search bbox
+  min_plausible_reflectance: 0.15      # reduceRegion(minMax()) sanity check; below this looks like edge-of-swath fill
+  cache_dir: data/scenes/cache         # per-split SQLite-WAL resume caches
+
+  # Orchestration: one GEE project per split (index-aligned with
+  # tiles.n_splits), each run in its own subprocess for real quota spreading.
+  ee_projects: []                      # e.g. [project-split0, project-split1, ...]
+  tile_workers: 1                      # tiles processed concurrently per split (real processes, never threads)
+  tile_work_timeout_s: 1800            # per-tile timeout before a stalled worker is killed and reassigned
+  run_all_splits: false                # true = scripts/03_download_scenes.py with no CLI flags runs every split in parallel (like --split all --parallel)
+
+# ----------------------------------------------------------------------
+# Spectral indices and annotation-to-training-cache export
+# ----------------------------------------------------------------------
+features:
+  train_root: data/train_cache          # one .npz/.json cache pair per annotated scene
+  mask_root: data/masks                 # MaskForge's SaveConfig.output_root -- {tile_id}_{sensor}_{scene_id}/mask.tif
+  # Where scripts/export_georeferenced_cache.py writes standalone georeferenced
+  # GeoTIFFs (features.tif + labels.tif per scene) reconstructed from train_root.
+  # This is the folder you zip/copy to hand training data to someone else, or
+  # to open a scene+mask in QGIS for a visual check -- no knowledge of this
+  # pipeline needed to use it.
+  geotiff_export_root: data/train_geotiff
+
+  # Which features actually go into the model's input stack, in this order.
+  # null (default) = use every available name. List a subset to disable the
+  # rest, e.g. to train on the 11 spectral indices only, set
+  # dem_layer_names: [] and leave index_names as null (or list all 11).
+  #
+  # Available index_names: NDVI, NDSI, NDWI_GAO, NBR, ND_SWIR1_SWIR2,
+  #   ND_BLUE_RED, ND_BLUE_NIR, ND_GREEN_RED, r, g, b
+  # Available dem_layer_names: elevation, slope, aspect
+  #
+  # Changing either list changes the model's input channel count -- retrain
+  # (scripts/05_train_model.py) whenever you change this, and re-export the
+  # training cache first (scripts/04_export_training_cache.py) since cached
+  # .npz files store the feature stack that was active when they were built.
+  index_names: [NDVI, NDSI, NDWI_GAO, NBR, ND_SWIR1_SWIR2, ND_BLUE_RED, ND_BLUE_NIR, ND_GREEN_RED, r, g, b]                     # e.g. [NDVI, NDSI, NDWI_GAO, NBR, ND_SWIR1_SWIR2, ND_BLUE_RED, ND_BLUE_NIR, ND_GREEN_RED, r, g, b]
+  dem_layer_names: [elevation, slope, aspect]                 # e.g. [] to disable DEM layers entirely, or [elevation, slope, aspect] for all
+
+# ----------------------------------------------------------------------
+# Train/val/test split
+# ----------------------------------------------------------------------
+split:
+  ratios: [0.7, 0.15, 0.15]             # [train, val, test], must sum to 1.0
+  split_seed: 0                         # seeded stratified shuffle -> reproducible split
+  drift_tolerance: 0.25                 # warn (never fail) if a partition's actual ratio drifts more than this fraction of target
+  split_assignment_path: data/train_cache/split_assignment.json
+
+# ----------------------------------------------------------------------
+# Model selection
+#
+# `type` is the ONE switch that picks which model actually trains/runs --
+# scripts/05_train_model.py and scripts/06_run_inference.py both dispatch on
+# this single field. Every sub-section below (threshold/random_forest/
+# catboost/unet/deeplabv3plus/segformer) is always present and always read by
+# pydantic, but only the one matching `type` is ever actually used --
+# the others are simply ignored, so you can keep tuned settings for more
+# than one model type around at once without deleting anything. To switch
+# models: change `type` to one of the six values below, nothing else.
+#
+#   type: threshold       -- Optuna-tuned per-band spectral-index thresholds
+#                             (cheapest, no GPU, good sanity-check baseline)
+#   type: random_forest    -- sklearn RandomForestClassifier on the flattened
+#                             per-pixel feature stack (no GPU needed)
+#   type: catboost          -- gradient-boosted trees (GPU by default, see
+#                             catboost.task_type below)
+#   type: unet               -- this project's primary model: a U-Net over
+#                             (patch_size x patch_size) image patches (GPU)
+#   type: deeplabv3plus      -- DeepLabv3+ (segmentation_models_pytorch ResNet
+#                             encoder, ASPP + low-level-feature decoder) baseline
+#                             for comparison against the U-Net (GPU)
+#   type: segformer           -- SegFormer (HuggingFace MiT backbone) baseline
+#                             for comparison against the U-Net (GPU)
+# ----------------------------------------------------------------------
+model:
+  type: unet
+
+  # -- type: threshold -----------------------------------------------------
+  threshold:
+    n_trials: 200                       # Optuna study size
+    sampler: tpe                        # tpe (Bayesian) | grid (exhaustive grid search)
+    timeout_s: null                     # optional wall-clock cap on the whole study (seconds); null = no cap
+    study_storage: null                 # null = in-memory only; or e.g. "sqlite:///threshold_study.db" to resume/inspect later
+
+  # -- type: random_forest --------------------------------------------------
+  random_forest:
+    n_estimators: 300
+    max_depth: null                     # null = unlimited depth
+    n_jobs: -1                          # -1 = use all available CPU cores
+    class_weight: balanced              # balanced | null (classes here are far from evenly represented)
+    random_state: 0
+
+  # -- type: catboost ---------------------------------------------------------
+  catboost:
+    iterations: 1000                    # upper bound; early_stopping_rounds usually stops sooner
+    learning_rate: 0.05
+    depth: 8
+    task_type: GPU                      # GPU | CPU -- set to CPU on a machine without a CUDA GPU
+    random_state: 0
+    early_stopping_rounds: 50
+
+  # -- type: unet ---------------------------------------------------------
+  unet:
+    base_ch: 48                         # first encoder stage's channel width (doubles each of the 3 deeper stages)
+    dropout_p: 0.0
+    use_spatial_context: false          # FiLM-conditions the first encoder stage on (x, y, year_norm, area_norm)
+    use_sensor_film: false              # only has an effect when training on more than one sensor at once
+    norm_type: batch                    # batch | group -- group is incompatible with multi-sensor training
+    bottleneck_attention: false         # self-attention over the bottleneck grid
+    bottleneck_attention_heads: 8       # only read when bottleneck_attention is true
+    deep_supervision: false             # auxiliary decoder-level logit heads, training-time only
+
+  # -- type: deeplabv3plus -----------------------------------------------------
+  deeplabv3plus:
+    backbone: resnet50                  # ResNet encoder variant (segmentation_models_pytorch)
+    pretrained: true                    # load ImageNet-pretrained backbone weights before replacing the input stem
+    dropout_p: 0.1
+
+  # -- type: segformer -----------------------------------------------------
+  segformer:
+    variant: mit-b0                     # mit-b0 (smallest) through mit-b5 (largest) -- HuggingFace MiT encoder size
+    pretrained: true                    # load pretrained encoder weights before replacing the input stem
+    dropout_p: 0.1
+
+# ----------------------------------------------------------------------
+# Training loop
+# Only used for the torch model types (unet/deeplabv3plus/segformer) --
+# threshold/random_forest/catboost fit directly via their own .fit() call,
+# not this epoch-based loop.
+# ----------------------------------------------------------------------
+training:
+  epochs: 100
+  batch_size: 16
+  patch_size: 256                       # must be <= the smallest tile's grid size for that sensor, or scenes get reflect-padded up to it
+  lr: 0.0003
+  weight_decay: 0.0001
+  patience: 15                          # epochs without improvement before early stopping
+  num_workers: 4
+  seed: 0
+  deterministic: false                  # true pins cuDNN to deterministic algorithms (slower, exactly reproducible)
+  amp: true                             # mixed precision (only takes effect on CUDA)
+  grad_clip_norm: 1.0
+  main_iou_metric: miou_macro           # miou_macro | miou_weighted | miou_inv_freq -- drives early stopping
+  augment_flips: true
+  augment_rotate90: true
+  checkpoint_dir: models/checkpoints
+  # Optional directional confusion penalties added to the loss, e.g. to
+  # extra-penalize predicting "open_water" (class 7) wherever the truth is
+  # "wetland_riparian_marsh" (class 6). Leave empty until real confusion
+  # patterns are observed in early training runs (see
+  # training.losses.ConfusionPenalty). true_class: null means "any class
+  # other than predicted_class".
+  confusion_penalties: []               # e.g. [{true_class: 6, predicted_class: 7, beta: 1.0}]
+
+# ----------------------------------------------------------------------
+# Optuna HPO
+# Only used for the torch model types. trials: 0 (default) skips the search
+# entirely and trains once at training's own hyperparameters above --
+# appropriate once those values are already tuned, or for a quick test.
+# trials: N runs N short trials (trial_epochs each) over search_space, then
+# retrains once at full length with the winning hyperparameters.
+#
+# search_space keys must be hyperparameters training/hpo.py actually knows
+# how to apply (see its _TRAINING_FIELDS/_MODEL_SUBSECTION_FIELDS tables) --
+# an unrecognised name raises immediately rather than being silently
+# ignored. Deliberately excludes patch_size/stride/batch_size from the
+# *default* space: varying those changes what a trial even measures
+# (different effective receptive field / tile population), making trials
+# incomparable -- only add them yourself if you specifically intend that.
+# ----------------------------------------------------------------------
+hpo:
+  trials: 0
+  trial_epochs: 25
+  sampler: tpe                          # tpe | cmaes | random
+  pruner: none                          # none | median | hyperband
+  storage: null                         # null = in-memory; or e.g. "sqlite:///hpo_study.db" to resume/inspect later
+  search_space:
+    lr:
+      type: log_uniform                 # log_uniform | uniform
+      bounds: [0.00001, 0.01]
+    weight_decay:
+      type: log_uniform
+      bounds: [0.000001, 0.01]
+    dropout_p:
+      type: uniform
+      bounds: [0.0, 0.5]
+
+# ----------------------------------------------------------------------
+# Multi-seed bootstrap ensembling
+# Trains bootstrap.n_seeds models (each seed optionally HPO-tuned per the
+# hpo section above), varying only the random seed -- never split.split_seed
+# -- and reports mean +/- population std across seeds. When enabled, this
+# REPLACES the single training run scripts/05_train_model.py otherwise does.
+# ----------------------------------------------------------------------
+bootstrap:
+  enabled: false
+  n_seeds: 5
+  seed_base: 0
+  create_ensemble: true                 # also writes every seed's weights side by side for softmax-averaged ensemble inference
+
+# ----------------------------------------------------------------------
+# Sliding-window inference
+# ----------------------------------------------------------------------
+inference:
+  patch_size: 256                       # usually matches training.patch_size
+  stride: 128                           # smaller stride = more overlap = smoother seams but slower
+  batch_size: 32
+  scene_precheck_min_valid_ratio: 0.30  # skip a scene below this finite-pixel fraction
+  overwrite: false
+  output_root: outputs/inference
+  # Ambiguity tie-break: below this top-two softmax confidence gap, the
+  # class_priority_order below wins instead of a plain argmax. 0/null = plain
+  # argmax always (default -- no calibration study has been run yet for this
+  # project).
+  ambiguity_threshold: null
+  class_priority_order: []              # empty = use the built-in default order (see inference/engine.py::DEFAULT_CLASS_PRIORITY_ORDER); or e.g. [7, 6, 8, 11, 9, 10, 5, 4, 3, 0, 1, 2, 12, 13] to override
+
+# ----------------------------------------------------------------------
+# Monthly composites
+# ----------------------------------------------------------------------
+composites:
+  sensor_resolution_priority: [s2, l9, l8, l7, l5]
+  default_rule: median                  # median | any_occurrence | fallback_occurrence, per class_id below
+  # Per-class override of default_rule. class_id values below match this
+  # project's own configs/classes.yaml -- adjust to your own taxonomy.
+  class_rules:
+    - class_id: 6   # cutblock_harvest: durable event, wins outright if seen even once in the month
+      rule: any_occurrence
+      priority: 1
+    - class_id: 7   # burned_disturbed: durable event, wins outright if seen even once in the month
+      rule: any_occurrence
+      priority: 2
+    - class_id: 9   # ice_cover: transient, fills in only if nothing else won the month's majority; beats snow
+      rule: fallback_occurrence
+      priority: 1
+    - class_id: 8   # snow_cover: transient, fills in only if nothing else won the month's majority
+      rule: fallback_occurrence
+      priority: 2
+  output_root: outputs/composites
+
+# ----------------------------------------------------------------------
+# AOI-wide mosaicking
+# Crop-and-place: each tile's monthly composite is cropped to its own
+# unbuffered search_bbox (discarding tiles.buffer_m), then placed onto one
+# continuous raster per period. Per-period output resolution is decided
+# automatically -- the finest resolution_m achieved by any tile that period,
+# coarser tiles nearest-neighbour-resampled up to it. Nothing to tune here
+# besides where the output goes.
+# ----------------------------------------------------------------------
+mosaic:
+  output_root: outputs/mosaics
+
+# ----------------------------------------------------------------------
+# Monthly per-tile spectral-index composites (change-detection analysis
+# only -- never fed to the land-cover model)
+# ----------------------------------------------------------------------
+index_composites:
+  output_root: outputs/index_composites
+
+# ----------------------------------------------------------------------
+# AOI-wide spectral-index mosaics
+# ----------------------------------------------------------------------
+index_mosaic:
+  output_root: outputs/index_mosaics
+
+# ----------------------------------------------------------------------
+# Local CCDC/COLD change detection
+# Runs entirely locally on this pipeline's own stored, already-classified
+# scenes -- never against Earth Engine's raw collections.
+# ----------------------------------------------------------------------
+ccdc:
+  lam: 20.0                             # Lasso regularization weight (pyxccd default; 20 for [0,10000]-scaled reflectance)
+  p_cg: 0.99                            # change-magnitude probability threshold
+  conse: 6                              # consecutive observations needed to confirm a break
+  min_clear_obs: 12                     # minimum clear (non-cloud/shadow) observations to attempt a fit
+  n_workers: 1                          # CPU processes to spread pixels across (never GPU -- no CUDA path exists)
+  output_root: outputs/ccdc
+
+# ----------------------------------------------------------------------
+# BFAST-Monitor fire cross-check (pure Python reimplementation)
+# ----------------------------------------------------------------------
+bfast:
+  monitor_start: "2020-01-01"           # split point: before = stable history, on/after = monitored for a break
+  order: 3                              # harmonic regression order (trend + this many (cos,sin) pairs)
+  alpha: 0.05                           # CUSUM significance level
+  min_history_obs: 12
+  min_monitoring_obs: 3
+  n_workers: 1                          # CPU processes (never GPU)
+  output_root: outputs/bfast
+
+# ----------------------------------------------------------------------
+# NDVI regrowth trajectory / dNBR burn severity
+# No NDSI snow filter here by design -- the trained classifier's own
+# snow_cover class already answers that from the same composites.
+# ----------------------------------------------------------------------
+regrowth_severity:
+  break_source: ccdc                    # ccdc | bfast -- which break-detection output supplies disturbance dates
+  output_root: outputs/regrowth_severity
+
+# ----------------------------------------------------------------------
+# Combined annual / month-to-month change maps
+# Three classification-change confidence bands, kept separate on purpose:
+# raw (noisy but immediate), persistent (confirmed over follow-up months),
+# corroborated (confirmed by a nearby CCDC/BFAST break).
+# ----------------------------------------------------------------------
+change_maps:
+  persistence_periods: 1                # follow-up months required to confirm a "persistent" change
+  corroboration_window_days: 45         # max days between a compared-period boundary and a CCDC/BFAST break to corroborate
+  output_root: outputs/change_maps

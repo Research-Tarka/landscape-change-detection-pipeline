@@ -1,0 +1,69 @@
+# pip-only dependencies not well served by conda-forge, or that need a
+# specific CUDA-matched build. Install after `conda env create -f environment.yml`
+# and `conda activate landscape-change-detection-pipeline`.
+#
+# `pip install -r requirements-torch.txt` alone pulls a CPU-only torch wheel.
+# For training, install a CUDA build first instead, matching your GPU driver's
+# supported CUDA version (check with `nvidia-smi`), then install the rest of
+# this file:
+#
+#   pip install torch --index-url https://download.pytorch.org/whl/cu130
+#   pip install -r requirements-torch.txt
+#
+# See https://pytorch.org/get-started/locally/ for other CUDA versions.
+#
+# This file lists only packages actually imported somewhere in src/scripts/tests.
+# Nothing is pre-added speculatively: each entry below has a real call site.
+
+# Deep learning
+torch>=2.0
+
+# torchvision itself is a transitive dependency of segmentation-models-pytorch
+# below (pretrained encoder weight loading), not imported directly by this
+# project's own code. Like torch, a CUDA build must be matched to the torch
+# build installed above -- install both from the same CUDA-tagged index URL
+# together, e.g.:
+#
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
+#
+# `pip install -r requirements-torch.txt` alone (no prior CUDA install) pulls
+# the matching CPU-only wheel instead, same as torch itself.
+torchvision>=0.15
+
+# DeepLabv3+ base model (landscape_change_detection_pipeline.models.deeplabv3plus,
+# model.type == "deeplabv3plus"). Used instead of torchvision's own
+# deeplabv3_resnet50/101, which only implement plain DeepLabv3 (ASPP head,
+# no low-level-feature skip decoder) -- see deeplabv3plus.py's module docstring
+# for why the decoder skip connection is the actual point of "the +".
+segmentation-models-pytorch>=0.3
+
+# HuggingFace SegformerForSemanticSegmentation base models
+# (landscape_change_detection_pipeline.models.segformer, model.type == "segformer").
+# Pure-Python/pip, no CUDA-tag-matched build needed -- a plain `pip install
+# transformers` (or this file) works regardless of the torch build installed.
+transformers>=4.30
+
+# Hyperparameter search (Optuna HPO and bootstrap ensembling)
+optuna>=3.5
+
+# Google Earth Engine scene search/download
+earthengine-api>=0.1.370
+
+# STAC access for auxiliary raster sources (DEM acquisition)
+pystac-client>=0.8
+
+# Vector AOI/tile geometry beyond geopandas' own deps
+geopandas>=0.14
+
+# CatBoost baseline classifier (landscape_change_detection_pipeline.models.catboost_model).
+# Not on conda-forge with GPU support pinned reliably, so it lives here with
+# the other pip-only entries. Unlike torch/torchvision above, CatBoost's GPU
+# support (task_type="GPU") is bundled into the standard PyPI wheel -- no
+# CUDA-tag-matched index URL needed, just a plain:
+#
+#   pip install catboost
+#
+# A CUDA-capable GPU and driver still need to be present at fit time for
+# task_type="GPU" to actually run; this project's CatBoostModel deliberately
+# does not fall back to CPU if that fails (see catboost_model.py).
+catboost>=1.2

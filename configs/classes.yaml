@@ -1,0 +1,126 @@
+# ----------------------------------------------------------------------
+# landscape-change-detection-pipeline — land-cover class definitions
+#
+# Single source of truth for the pipeline's land-cover classes. Consumed
+# directly by this pipeline's training code
+# (src/landscape_change_detection_pipeline/classes/class_config.py) and converted into a
+# MaskForge ClassPalette JSON (same module, `to_maskforge_palette`) so
+# classes are never defined twice.
+#
+# Rules for editing this file:
+#   - `id` is a stable integer, assigned once and never reused or renumbered.
+#     Adding a class means appending a new id at the end of the list; it must
+#     never change the id of an existing class, since ids are already burned
+#     into annotation rasters. Splitting a class (e.g. "wetland/riparian"
+#     into finer subclasses) means adding new class entries with
+#     new ids, not editing/removing the old one, so existing annotations
+#     stay valid.
+#   - `change_eligible: false` marks classes that must never count in
+#     change-detection comparisons (cloud, shadow -- these are imaging
+#     artifacts, not land cover).
+#
+# Design notes
+# ------------
+# Every class here is chosen to be detectable at this pipeline's actual
+# working resolution (10-30 m, Landsat/Sentinel-2) -- sub-pixel features
+# (seismic lines, pipeline right-of-ways, a few metres wide) are
+# deliberately NOT modelled as separate classes; they cannot be resolved at
+# this resolution and would only add label noise. Tree species/type is
+# likewise not modelled here -- that is better sourced from an external
+# forest inventory layer than duplicated from satellite spectral signal,
+# which cannot reliably tell species apart at this resolution either.
+# Two disturbance types that DO have distinct spatial/spectral
+# signatures even at 30 m are kept separate: `cutblock_harvest` (sharp
+# rectangular geometry, cut timber) vs. `burned_disturbed` (irregular
+# perimeter, ash/char signature) -- distinct disturbance timing and recovery
+# trajectories, and visually distinguishable at this pipeline's resolution.
+# `snow_cover` and `ice_cover` are kept separate rather than merged:
+# seasonal snow on ground/vegetation and frozen water bodies have distinct
+# spectral/textural signatures and very different ecological meaning
+# (winter water access).
+# ----------------------------------------------------------------------
+
+classes:
+  - id: 0
+    name: forest
+    display_name: "Forest (conifer, mixed, deciduous -- species from an external forest inventory, not this classifier)"
+    color: [34, 94, 42]
+    change_eligible: true
+
+  - id: 1
+    name: bare_ground
+    display_name: "Bare ground (unvegetated soil -- trails/paths worn bare, vegetation not yet regrown, natural or disturbed bare soil not covered by another class)"
+    color: [200, 170, 130]
+    change_eligible: true
+
+  - id: 2
+    name: grassland_herbaceous
+    display_name: "Grassland / herbaceous / open range / pasture"
+    color: [140, 200, 90]
+    change_eligible: true
+
+  - id: 3
+    name: cultivated_agriculture
+    display_name: "Cultivated field / agriculture"
+    color: [230, 182, 92]
+    change_eligible: true
+
+  - id: 4
+    name: wetland_marsh
+    display_name: "Wetland / marsh / riparian vegetation"
+    color: [66, 168, 154]
+    change_eligible: true
+
+  - id: 5
+    name: open_water
+    display_name: "Open water (stream, pond, lake, river -- unfrozen)"
+    color: [40, 96, 191]
+    change_eligible: true
+
+  - id: 6
+    name: cutblock_harvest
+    display_name: "Recent forest harvest (cutblock -- sharp rectangular geometry, cut timber)"
+    color: [176, 124, 60]
+    change_eligible: true
+
+  - id: 7
+    name: burned_disturbed
+    display_name: "Burned / fire-disturbed ground (irregular perimeter, ash/char)"
+    color: [140, 60, 40]
+    change_eligible: true
+
+  - id: 8
+    name: snow_cover
+    display_name: "Snow cover (seasonal, on ground/vegetation, or on a glacier surface)"
+    color: [235, 245, 255]
+    change_eligible: true
+
+  - id: 9
+    name: ice_cover
+    display_name: "Ice cover (frozen lakes/rivers, or exposed glacier ice)"
+    color: [180, 220, 235]
+    change_eligible: true
+
+  - id: 10
+    name: rock_alpine_bare
+    display_name: "Rock / bare non-vegetated (natural, below treeline)"
+    color: [153, 153, 153]
+    change_eligible: true
+
+  - id: 13
+    name: built_up_infrastructure
+    display_name: "Built-up infrastructure (buildings, settlements, paved/gravel roads, well pads, quarries)"
+    color: [200, 30, 30]
+    change_eligible: true
+
+  - id: 14
+    name: cloud
+    display_name: "Cloud"
+    color: [225, 225, 230]
+    change_eligible: false
+
+  - id: 15
+    name: shadow
+    display_name: "Shadow"
+    color: [40, 40, 40]
+    change_eligible: false

@@ -1,0 +1,16 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+type: software
+title: "landscape-change-detection-pipeline"
+abstract: >
+  A satellite-imagery land-cover and change-detection pipeline: multi-sensor
+  (Landsat 5/7/8/9, Sentinel-2) scene download, per-pixel classification via
+  a trained U-Net, monthly composites, and pixel-level breakpoint/change
+  detection (CCDC, BFAST, dNBR, NDVI regrowth). The class taxonomy and
+  compositing rules are fully swappable, so the same pipeline applies to any
+  land-cover or land-surface classification and change-analysis problem.
+authors:
+  - family-names: "Tarka"
+    given-names: "Maxime"
+    email: "maxime.tarka@gmail.com"
+license: MIT
