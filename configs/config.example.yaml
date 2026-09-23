@@ -43,6 +43,10 @@ tiles:
   tile_size_m: 8000.0        # square tile side, before buffering (metres)
   buffer_m: 250.0            # edge buffer added to each tile's analysis window (metres)
   pilot_bbox: null           # optional [minx, miny, maxx, maxy] in aoi_crs, to restrict to a pilot sub-area
+  # By default pilot_bbox must overlap the AOI polygon (raises otherwise). Set to
+  # false to tile pilot_bbox as a standalone window when it's deliberately outside
+  # the tracked AOI (e.g. a separate study zone not yet added to the AOI gpkg).
+  pilot_bbox_requires_aoi_overlap: true
   # Prepended to every generated tile_id ("tile_0000_0000" -> "<prefix>_tile_0000_0000").
   # tile_id is just a row/col index into YOUR OWN AOI grid -- two people tiling
   # different AOIs will independently produce the same tile_0000_0000, which

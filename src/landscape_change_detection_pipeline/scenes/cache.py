@@ -37,7 +37,7 @@ from typing import Iterator, Optional
 
 CACHE_FILENAME_TEMPLATE = "scene_cache_split{split}.sqlite3"
 
-_SCHEMA = """
+_CREATE_TABLE = """
 CREATE TABLE IF NOT EXISTS scenes (
     tile_id     TEXT NOT NULL,
     sensor      TEXT NOT NULL,
@@ -50,6 +50,13 @@ CREATE TABLE IF NOT EXISTS scenes (
     cached_at   TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (tile_id, sensor, scene_id)
 );
+"""
+
+#: Indexes reference ``month``, so they must be created only after the
+#: migration below has guaranteed the column exists -- otherwise
+#: ``CREATE INDEX ... (..., month)`` fails with "no such column: month" on a
+#: database created before that column existed.
+_CREATE_INDEXES = """
 CREATE INDEX IF NOT EXISTS idx_scenes_tile_sensor_year
     ON scenes (tile_id, sensor, year);
 CREATE INDEX IF NOT EXISTS idx_scenes_tile_sensor_year_month
@@ -88,11 +95,12 @@ def open_cache(cache_dir: str | Path, split: int) -> Iterator[sqlite3.Connection
         try:
             conn.execute("PRAGMA journal_mode=WAL;")
             conn.execute("PRAGMA synchronous=NORMAL;")
-            conn.executescript(_SCHEMA)
+            conn.executescript(_CREATE_TABLE)
             existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(scenes)").fetchall()}
-            for migration in _MIGRATIONS:
-                if "month" not in existing_cols:
+            if "month" not in existing_cols:
+                for migration in _MIGRATIONS:
                     conn.execute(migration)
+            conn.executescript(_CREATE_INDEXES)
             conn.commit()
         except Exception:
             conn.close()

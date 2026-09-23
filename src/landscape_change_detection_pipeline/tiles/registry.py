@@ -106,21 +106,34 @@ def _epsg_of(crs: str) -> Optional[int]:
         return None
 
 
-def aoi_geometry(gdf: gpd.GeoDataFrame, pilot_bbox: Optional[Sequence[float]] = None):
+def aoi_geometry(
+    gdf: gpd.GeoDataFrame,
+    pilot_bbox: Optional[Sequence[float]] = None,
+    pilot_bbox_requires_aoi_overlap: bool = True,
+):
     """Return the single geometry tiling is run against.
 
     Dissolves the AOI layer's rows into one geometry, then -- if
     ``pilot_bbox`` is given -- intersects it with that ``[minx, miny, maxx,
     maxy]`` window (in the same CRS as ``gdf``), so a pilot run covers only a
     small area without touching any code.
+
+    If ``pilot_bbox_requires_aoi_overlap`` is False, a ``pilot_bbox`` that
+    doesn't intersect the AOI polygon is used as-is (as a standalone tiling
+    window) instead of raising -- for pilot zones deliberately outside the
+    tracked AOI.
     """
     geom = gdf.geometry.union_all() if hasattr(gdf.geometry, "union_all") else gdf.geometry.unary_union
     if pilot_bbox is not None:
         if len(pilot_bbox) != 4:
             raise TilingError(f"pilot_bbox must have 4 values [minx, miny, maxx, maxy], got {pilot_bbox}")
-        geom = geom.intersection(box(*pilot_bbox))
-        if geom.is_empty:
+        bbox_geom = box(*pilot_bbox)
+        intersection = geom.intersection(bbox_geom)
+        if intersection.is_empty:
+            if not pilot_bbox_requires_aoi_overlap:
+                return bbox_geom
             raise TilingError("pilot_bbox does not intersect the AOI geometry.")
+        geom = intersection
     return geom
 
 
@@ -209,11 +222,12 @@ def build_registry(
     tile_size_m: float = DEFAULT_TILE_SIZE_M,
     buffer_m: float = DEFAULT_BUFFER_M,
     pilot_bbox: Optional[Sequence[float]] = None,
+    pilot_bbox_requires_aoi_overlap: bool = True,
     tile_id_prefix: str = "",
 ) -> pd.DataFrame:
     """Load the AOI and build its tile registry table. See module docstring."""
     gdf = load_aoi(aoi_path, aoi_layer, aoi_crs)
-    geom = aoi_geometry(gdf, pilot_bbox)
+    geom = aoi_geometry(gdf, pilot_bbox, pilot_bbox_requires_aoi_overlap)
     registry = build_tile_grid(geom, tile_size_m, buffer_m, tile_id_prefix)
     registry["crs"] = str(gdf.crs)
     return registry

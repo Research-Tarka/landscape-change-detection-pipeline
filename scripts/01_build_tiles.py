@@ -63,6 +63,7 @@ def main(argv: list[str] | None = None) -> int:
         tile_size_m=tiles_cfg.tile_size_m,
         buffer_m=tiles_cfg.buffer_m,
         pilot_bbox=pilot_bbox,
+        pilot_bbox_requires_aoi_overlap=tiles_cfg.pilot_bbox_requires_aoi_overlap,
         tile_id_prefix=tiles_cfg.tile_id_prefix,
     )
     out_path = write_registry(registry, tiles_cfg.registry_path)

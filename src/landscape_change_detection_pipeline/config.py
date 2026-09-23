@@ -95,6 +95,9 @@ class TilesConfig(BaseModel):
     tile_size_m: float = 8000.0
     buffer_m: float = 250.0
     pilot_bbox: Optional[list[float]] = None
+    # If False, a pilot_bbox outside the AOI polygon is tiled as-is instead
+    # of raising -- for pilot zones deliberately outside the tracked AOI.
+    pilot_bbox_requires_aoi_overlap: bool = True
     tile_id_prefix: str = ""
     registry_path: str = "data/tiles/tile_registry.parquet"
     n_splits: int = 1
