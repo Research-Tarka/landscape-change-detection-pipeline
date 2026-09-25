@@ -90,6 +90,15 @@ scene_download:
   run_all_splits: false                # true = scripts/03_download_scenes.py with no CLI flags runs every split in parallel (like --split all --parallel)
 
 # ----------------------------------------------------------------------
+# Topographic (illumination) correction -- disabled: per-pixel SCS+C ratio
+# noise (from DEM slope/aspect at pixel level) produces visible blotchy
+# artifacts in RGB composites even with the ratio clipped and a single
+# scene-wide C shared across bands. Re-enable only after further tuning.
+# ----------------------------------------------------------------------
+topographic_correction:
+  enabled: false
+
+# ----------------------------------------------------------------------
 # Spectral indices and annotation-to-training-cache export
 # ----------------------------------------------------------------------
 features:
@@ -137,14 +146,22 @@ split:
 # pydantic, but only the one matching `type` is ever actually used --
 # the others are simply ignored, so you can keep tuned settings for more
 # than one model type around at once without deleting anything. To switch
-# models: change `type` to one of the six values below, nothing else.
+# models: change `type` to one of the seven values below, nothing else.
 #
 #   type: threshold       -- Optuna-tuned per-band spectral-index thresholds
 #                             (cheapest, no GPU, good sanity-check baseline)
 #   type: random_forest    -- sklearn RandomForestClassifier on the flattened
-#                             per-pixel feature stack (no GPU needed)
+#                             per-pixel feature stack (no GPU needed, but no
+#                             incremental fit either -- the full dense pixel
+#                             matrix must fit in RAM at once; prefer lightgbm
+#                             below on a large corpus, see its own note)
 #   type: catboost          -- gradient-boosted trees (GPU by default, see
 #                             catboost.task_type below)
+#   type: lightgbm           -- histogram-based gradient-boosted trees (CPU by
+#                             default, see lightgbm.device below); the
+#                             RAM-conscious alternative to random_forest on a
+#                             large training corpus (no full dense matrix kept
+#                             resident once LightGBM's own Dataset is built)
 #   type: unet               -- this project's primary model: a U-Net over
 #                             (patch_size x patch_size) image patches (GPU)
 #   type: deeplabv3plus      -- DeepLabv3+ (segmentation_models_pytorch ResNet
@@ -177,6 +194,22 @@ model:
     learning_rate: 0.05
     depth: 8
     task_type: GPU                      # GPU | CPU -- set to CPU on a machine without a CUDA GPU
+    random_state: 0
+    early_stopping_rounds: 50
+
+  # -- type: lightgbm -----------------------------------------------------
+  # device: cpu is the confirmed-working default -- the standard `pip install
+  # lightgbm` wheel has no GPU/CUDA tree learner built in (confirmed live: both
+  # fail with "Tree Learner was not enabled in this build"). gpu/cuda need a
+  # from-source LightGBM build (cmake -DUSE_GPU=1 / -DUSE_CUDA=1); only switch
+  # this after re-confirming that build actually works on your machine.
+  lightgbm:
+    num_leaves: 31
+    learning_rate: 0.05
+    n_estimators: 1000                  # upper bound; early_stopping_rounds usually stops sooner
+    max_depth: -1                       # -1 = unlimited depth
+    min_data_in_leaf: 20
+    device: cpu                         # cpu | gpu | cuda -- see note above
     random_state: 0
     early_stopping_rounds: 50
 

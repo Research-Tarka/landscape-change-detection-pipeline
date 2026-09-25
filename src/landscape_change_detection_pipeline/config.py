@@ -112,11 +112,18 @@ class DemConfig(BaseModel):
     lets a run disable the fallback entirely (fail loud on MRDEM gaps rather
     than silently substituting a canopy-biased source); ``force_copernicus``
     is a debug/test switch to exercise the fallback path deliberately.
+    ``target_resolution_m`` is the pipeline's single reference grid
+    resolution -- the DEM is no longer fetched at its own native 30 m;
+    instead every source DEM is reprojected onto this resolution, and every
+    later per-tile array (every sensor's scenes, every feature stack, every
+    label) must land on this exact grid (see ``dem/grid_check.py`` and
+    ``docs/decisions/unified_10m_grid.md``).
     """
 
     tile_dir: str = "data/tiles"
     use_copernicus_fallback: bool = True
     force_copernicus: bool = False
+    target_resolution_m: float = 10.0
 
 
 class SceneDownloadConfig(BaseModel):
@@ -167,6 +174,146 @@ class SceneDownloadConfig(BaseModel):
     tile_workers: int = 1
     tile_work_timeout_s: int = 1800
     run_all_splits: bool = False
+
+
+class TopographicCorrectionConfig(BaseModel):
+    """Illumination-normalization parameters (see
+    :mod:`landscape_change_detection_pipeline.features.topographic_correction`).
+
+    Corrects the reflectance difference between a sun-facing and a shaded
+    slope of the same land cover, using each tile's own slope/aspect (DEM
+    stage) plus each scene's solar illumination geometry at acquisition
+    time. ``method`` selects the correction formula; ``"scs_c"``
+    (Sun-Canopy-Sensor + C correction, Soenen et al. 2005) is the default --
+    a standard, moderate-terrain-safe choice in the current topographic-
+    correction literature that avoids over-correction on near-flat pixels
+    (unlike plain Cosine correction) without SCS's own tendency to
+    over-correct steep slopes. ``min_sun_elevation_deg`` skips correction
+    entirely for a scene with implausibly low sun angle (near sunrise/sunset
+    geometry makes the correction numerically unstable, dividing by a
+    near-zero cosine term).
+    """
+
+    enabled: bool = True
+    method: str = "scs_c"
+    min_sun_elevation_deg: float = 5.0
+    #: Band label the scene-wide ``C`` parameter is fit against, then reused
+    #: for every band (see ``features/topographic_correction.py``'s module
+    #: docstring for why one shared fit replaces an independent per-band
+    #: fit -- fixes a color-balance drift confirmed to appear in the RGB
+    #: composites when each band was corrected independently).
+    reference_band: str = "nir"
+    #: Bounds on the per-pixel correction ratio -- see
+    #: ``features/topographic_correction.py::DEFAULT_RATIO_CLIP_MIN``/
+    #: ``DEFAULT_RATIO_CLIP_MAX`` for why (bounds an outlier pixel's
+    #: correction regardless of how well-behaved the scene-wide fit is).
+    ratio_clip_min: float = 0.2
+    ratio_clip_max: float = 5.0
+
+    @field_validator("method")
+    @classmethod
+    def _validate_method(cls, value: str) -> str:
+        if value not in ("scs_c",):
+            raise ValueError(f"topographic_correction.method must be 'scs_c', got {value!r}")
+        return value
+
+
+class BandpassCoefficient(BaseModel):
+    """One band's linear bandpass-adjustment coefficient (see
+    :mod:`landscape_change_detection_pipeline.scenes.harmonize`):
+    ``y = scale * x + offset``."""
+
+    scale: float = 1.0
+    offset: float = 0.0
+
+
+#: Claverie et al. 2018 / HLS v1.4's published MSI->OLI coefficients
+#: (S2A), algebraically inverted to OLI->MSI (Landsat onto Sentinel-2's
+#: convention, this pipeline's harmonization direction -- see
+#: scenes/harmonize.py's module docstring). Same table for all four Landsat
+#: sensors (TM/ETM+/OLI share one equivalent-band mapping in the published
+#: coefficients).
+_LANDSAT_TO_S2_BANDPASS_COEFFICIENTS: dict[str, BandpassCoefficient] = {
+    "blue": BandpassCoefficient(scale=1.022704, offset=0.004091),
+    "green": BandpassCoefficient(scale=0.994728, offset=0.000895),
+    "red": BandpassCoefficient(scale=1.024066, offset=-0.000922),
+    "nir": BandpassCoefficient(scale=1.001703, offset=0.000100),
+    "swir1": BandpassCoefficient(scale=1.001302, offset=0.001101),
+    "swir2": BandpassCoefficient(scale=0.997009, offset=0.001196),
+}
+
+
+class HarmonizationConfig(BaseModel):
+    """Cross-sensor radiometric bandpass adjustment (see
+    :mod:`landscape_change_detection_pipeline.scenes.harmonize`).
+
+    Brings Landsat's stored bands onto Sentinel-2's radiometric convention
+    via a per-band linear transform (``y = scale*x + offset``), the
+    bandpass-adjustment piece of NASA's HLS method (Claverie et al. 2018) --
+    BRDF normalization (HLS's other major component) is out of scope, see
+    ``docs/decisions/cross_sensor_harmonization.md``.
+    ``coefficients`` is ``{sensor_key: {band_label: BandpassCoefficient}}``
+    (band *labels* -- blue/green/red/nir/swir1/swir2 -- not raw EE band
+    names, so one table works across L5/L7/L8/L9's differing band-name
+    layouts); Sentinel-2 is the harmonization target and is never itself
+    adjusted. Applied at scene-storage time (``scenes/process_scene.py``),
+    after reflectance scale/offset conversion and before topographic
+    correction -- see the decision doc for why storage-time was chosen over
+    training-cache-export-time.
+
+    ``enabled`` defaults to ``False``: the published coefficients were fit
+    on Surface Reflectance (SR-to-SR spectral response differences), and
+    this pipeline runs on TOA (``docs/decisions/toa_rollback.md``) --
+    applying an SR-derived linear correction to TOA reflectance is not
+    radiometrically justified (TOA still carries the atmospheric path-
+    radiance contribution the SR fit implicitly assumes is already
+    removed). Left here as an explicit, documented opt-in rather than
+    removed outright, in case TOA-appropriate coefficients are derived
+    later -- see ``docs/decisions/cross_sensor_harmonization.md`` for the
+    full reasoning. Out of scope for the current TOA-rollback work.
+    """
+
+    enabled: bool = False
+    coefficients: dict[str, dict[str, BandpassCoefficient]] = Field(
+        default_factory=lambda: {
+            sensor_key: dict(_LANDSAT_TO_S2_BANDPASS_COEFFICIENTS)
+            for sensor_key in ("L5", "L7", "L8", "L9")
+        }
+    )
+
+
+class RgbCompositesConfig(BaseModel):
+    """Which RGB visualization composites to build per scene (see
+    :mod:`landscape_change_detection_pipeline.scenes.composites`), and their
+    shared stretch tunables.
+
+    Four selectable views, each independently toggleable so a view nobody
+    has validated yet does not cost compute/storage by default:
+
+    - ``true_color_enabled`` (``rgb_true_color``, was ``rgb_raw``):
+      percentile-stretched real red/green/blue.
+    - ``true_color_shadow_enabled`` (``rgb_true_color_shadow``, was
+      ``rgb_shadow``): asinh-compressed + gamma-boosted real red/green/blue,
+      recovering shadow detail on this mountainous AOI's valley shadow.
+    - ``natural_color_enabled`` (``rgb_natural_color``, new): SWIR2/NIR/red
+      as R/G/B, percentile stretched -- a moisture/burn-scar-sensitive
+      interpretation composite. Off by default until visually validated.
+    - ``color_infrared_enabled`` (``rgb_color_infrared``, new): NIR/red/green
+      as R/G/B, percentile stretched -- the standard vegetation-vigor false-
+      color composite. Off by default until visually validated.
+
+    ``asinh_k``/``gamma`` tune ``true_color_shadow``'s asinh-compression
+    steepness and gamma boost (see
+    ``scenes/composites.py::asinh_shadow_stretch``) -- exposed here rather
+    than hardcoded so they can be tuned by eye without a code change.
+    """
+
+    true_color_enabled: bool = True
+    true_color_shadow_enabled: bool = True
+    natural_color_enabled: bool = False
+    color_infrared_enabled: bool = False
+    asinh_k: float = 8.0
+    gamma: float = 1.0 / 2.2
 
 
 class FeaturesConfig(BaseModel):
@@ -250,24 +397,54 @@ class SplitConfig(BaseModel):
     fraction-of-target threshold beyond which a partition's actual
     scene-count ratio triggers a (non-fatal) drift warning after coverage
     repair. ``split_assignment_path`` records the resulting
-    ``{tile_id: partition}`` assignment.
+    ``{tile_id: partition}`` assignment (unused when ``split_by="scene"``,
+    since there is then no tile-level assignment to record).
+
+    ``split_by`` selects the leakage-preventing unit: ``"tile"`` (default)
+    keeps every scene from one tile in the same partition -- the safer
+    choice once there is enough annotated data that tile-level stratified
+    coverage repair can actually find a valid split. ``"scene"`` splits at
+    the individual scene level instead, ignoring which tile a scene came
+    from -- appropriate only while the annotated corpus is still small
+    enough that tile-level splitting can't guarantee every class appears in
+    every partition (few tiles means few whole units to redistribute, so
+    the class-coverage repair passes can run out of tiles to move). Scene-
+    level splitting accepts a real risk of leakage (two scenes of the same
+    tile, correlated by footprint/season, can land in different
+    partitions) in exchange for finer-grained control over per-partition
+    class representation. Applies uniformly to every model type (torch and
+    non-torch alike), since both paths through ``scripts/05_train_model.py``
+    call the same :func:`~landscape_change_detection_pipeline.training.dataset.split_scenes`.
     """
 
     ratios: list[float] = Field(default_factory=lambda: [0.7, 0.15, 0.15])
     split_seed: int = 0
     drift_tolerance: float = 0.25
     split_assignment_path: str = "data/train_cache/split_assignment.json"
+    split_by: str = "tile"
+
+    @field_validator("split_by")
+    @classmethod
+    def _validate_split_by(cls, value: str) -> str:
+        if value not in ("tile", "scene"):
+            raise ValueError(f"split.split_by must be 'tile' or 'scene', got {value!r}")
+        return value
 
 
-#: The seven selectable model "technologies" (see
+#: The eight selectable model "technologies" (see
 #: :mod:`landscape_change_detection_pipeline.models.registry`). ``grid_search`` is folded
 #: into ``threshold`` (both are handled by the Optuna-tuned spectral-index
 #: thresholder; a plain grid search is just a non-Bayesian ``sampler``
-#: choice on the same search), so only six distinct dispatch targets exist.
+#: choice on the same search), so only seven distinct dispatch targets exist.
+#: ``lightgbm`` is a separate, additive option alongside ``random_forest`` --
+#: not a replacement -- added specifically to fix ``random_forest``'s RAM
+#: blowup on this project's real training corpus (see
+#: ``models/lightgbm_model.py``'s module docstring).
 MODEL_TYPES: tuple[str, ...] = (
     "threshold",
     "random_forest",
     "catboost",
+    "lightgbm",
     "unet",
     "deeplabv3plus",
     "segformer",
@@ -326,6 +503,41 @@ class CatBoostConfig(BaseModel):
     learning_rate: float = 0.05
     depth: int = 8
     task_type: str = "GPU"
+    random_state: int = 0
+    early_stopping_rounds: int = 50
+
+
+class LightGBMConfig(BaseModel):
+    """Hyperparameters for the LightGBM classifier (see
+    :mod:`landscape_change_detection_pipeline.models.lightgbm_model`).
+
+    Added specifically to fix ``random_forest``'s RAM blowup on this
+    project's real training corpus (confirmed live: sklearn's
+    ``RandomForestClassifier`` saturating 32 GB, since it has no incremental
+    fit and must hold the full dense pixel matrix -- plus every bootstrap
+    tree's own bookkeeping -- resident at once). LightGBM's histogram-binned
+    ``Dataset`` avoids that; see the model module's own docstring for the
+    full memory-management reasoning.
+
+    ``device="cpu"`` is the default, not ``"gpu"``/``"cuda"``: confirmed
+    live on this project's own machine (RTX 5070 Laptop GPU) that the
+    standard ``pip install lightgbm`` wheel has neither GPU nor CUDA tree
+    learners enabled (``LightGBMError: ... Tree Learner was not enabled in
+    this build``) -- unlike CatBoost, which only defaults to GPU because
+    that was already confirmed working here. Switching to ``"gpu"``/
+    ``"cuda"`` requires a from-source LightGBM build with the matching CMake
+    flag, not currently set up for this project; only change this default
+    after re-confirming a GPU build actually works live, not from this
+    comment alone. ``early_stopping_rounds`` only takes effect when a
+    validation set is available (mirrors ``CatBoostConfig``'s own field).
+    """
+
+    num_leaves: int = 31
+    learning_rate: float = 0.05
+    n_estimators: int = 1000
+    max_depth: int = -1
+    min_data_in_leaf: int = 20
+    device: str = "cpu"
     random_state: int = 0
     early_stopping_rounds: int = 50
 
@@ -389,11 +601,11 @@ class ModelConfig(BaseModel):
     """Land-cover model selection (see
     :mod:`landscape_change_detection_pipeline.models.registry`).
 
-    ``type`` is the single switch that selects which of the seven supported
+    ``type`` is the single switch that selects which of the eight supported
     approaches (spectral-index thresholds tuned by Optuna, folding in a
     plain grid search as a ``threshold.sampler`` choice; random forest;
-    CatBoost; U-Net; DeepLabv3+; SegFormer) inference and training actually
-    use; :func:`landscape_change_detection_pipeline.models.registry.build_model`
+    CatBoost; LightGBM; U-Net; DeepLabv3+; SegFormer) inference and training
+    actually use; :func:`landscape_change_detection_pipeline.models.registry.build_model`
     dispatches on it. Every other field here is a nested, always-present
     sub-section holding that one model type's own hyperparameters --
     unused sub-sections are simply ignored rather than omitted, so a config
@@ -405,6 +617,7 @@ class ModelConfig(BaseModel):
     threshold: ThresholdConfig = Field(default_factory=ThresholdConfig)
     random_forest: RandomForestConfig = Field(default_factory=RandomForestConfig)
     catboost: CatBoostConfig = Field(default_factory=CatBoostConfig)
+    lightgbm: LightGBMConfig = Field(default_factory=LightGBMConfig)
     unet: UnetConfig = Field(default_factory=UnetConfig)
     deeplabv3plus: Deeplabv3PlusConfig = Field(default_factory=Deeplabv3PlusConfig)
     segformer: SegformerConfig = Field(default_factory=SegformerConfig)
@@ -764,6 +977,9 @@ class PipelineConfig(BaseModel):
     tiles: TilesConfig = Field(default_factory=TilesConfig)
     dem: DemConfig = Field(default_factory=DemConfig)
     scene_download: SceneDownloadConfig = Field(default_factory=SceneDownloadConfig)
+    harmonization: HarmonizationConfig = Field(default_factory=HarmonizationConfig)
+    topographic_correction: TopographicCorrectionConfig = Field(default_factory=TopographicCorrectionConfig)
+    rgb_composites: RgbCompositesConfig = Field(default_factory=RgbCompositesConfig)
     features: FeaturesConfig = Field(default_factory=FeaturesConfig)
     split: SplitConfig = Field(default_factory=SplitConfig)
     model: ModelConfig = Field(default_factory=lambda: ModelConfig(type="unet"))

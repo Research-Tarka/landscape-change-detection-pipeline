@@ -7,14 +7,15 @@ each tile's full multi-decade time series, independent of the land-cover
 classification -- a direct, statistically-grounded disturbance-timing signal,
 in place of the static inventory-age fields this kind of analysis usually
 depends on. Runs entirely on
-this pipeline's own already-downloaded, already-pansharpened reflectance
-(``data/tiles/<tile_id>.zarr``) via `pyxccd <https://pypi.org/project/pyxccd/>`_
+this pipeline's own already-downloaded, already-resampled-onto-the-DEM's-grid
+reflectance (``data/tiles/<tile_id>.zarr``) via
+`pyxccd <https://pypi.org/project/pyxccd/>`_
 (the actively-maintained local Python COLD/CCDC implementation), never
 against Earth Engine's server-side collections: GEE's raw
-collections are not pansharpened/DSen2-resampled the way this pipeline's own
-stored bands are, so running CCDC against them would detect breaks on pixels
-that do not correspond 1:1 to the pixels this project's own classification
-and mosaics operate on.
+collections are not resampled onto this pipeline's unified 10 m/DEM grid the
+way this pipeline's own stored bands are, so running CCDC against them would
+detect breaks on pixels that do not correspond 1:1 to the pixels this
+project's own classification and mosaics operate on.
 
 One shared grid per tile, at the finest resolution ever available
 ---------------------------------------------------------------------

@@ -212,7 +212,10 @@ NODATA_LABEL = 255
 
 def read_mask_labels(mask_path: str | Path, class_config: ClassConfig) -> np.ndarray:
     """Read a MaskForge RGBA mask GeoTIFF/PNG and convert it to a
-    ``(H, W)`` uint8 class-index array, using the same color -> id mapping
+    ``(H, W)`` uint8 **dense** class-index array (0..N-1, position in
+    ``class_config.classes`` -- see ``ClassConfig``'s own docstring for why
+    dense ids, not raw ``ClassDef.id``, are what every tensor-shaping
+    consumer downstream needs), using the same color -> class mapping
     ``configs/classes.yaml`` defines (mirrors MaskForge's own
     ``raster_io.rgba_to_classes``).
 
@@ -220,7 +223,7 @@ def read_mask_labels(mask_path: str | Path, class_config: ClassConfig) -> np.nda
     (0, 0, 0)) for any pixel the annotator never painted -- NOT a specific
     RGB color, and NOT class id 0. Unmatched pixels are written as
     NODATA_LABEL (255), not 0, or every unpainted pixel would silently train
-    as whatever class happens to have id 0 (here: forest). 255 is also
+    as whatever class happens to have dense id 0 (here: forest). 255 is also
     already ``training.losses.IGNORE_INDEX``, so the training loop excludes
     these pixels from the loss/metrics with no further changes needed.
     """
@@ -232,7 +235,7 @@ def read_mask_labels(mask_path: str | Path, class_config: ClassConfig) -> np.nda
 
     h, w = rgba.shape[:2]
     labels = np.full((h, w), NODATA_LABEL, dtype=np.uint8)
-    for class_def in class_config.classes:
+    for dense_id, class_def in enumerate(class_config.classes):
         color = class_def.color
         match = (
             (rgba[:, :, 0] == color[0])
@@ -240,7 +243,7 @@ def read_mask_labels(mask_path: str | Path, class_config: ClassConfig) -> np.nda
             & (rgba[:, :, 2] == color[2])
             & (rgba[:, :, 3] == 255)
         )
-        labels[match] = class_def.id
+        labels[match] = dense_id
     return labels
 
 
@@ -254,15 +257,11 @@ def bands_for_scene(tile_dir: str | Path, tile_id: str, sensor: str, scene_id: s
     band_names: list[str] = list(attrs["band_names"])
     band_provenance_raw: dict[str, str] = dict(attrs.get("band_provenance", {}))
 
-    toa, _rgb_raw, _rgb_shadow = read_scene(tile_dir, tile_id, sensor, scene_id)
+    toa, _rgb_composites = read_scene(tile_dir, tile_id, sensor, scene_id)
     reflectance = uint16_to_reflectance(toa)
 
-    #: BandRole.PANSHARPEN maps to the "not genuine detail at the
-    #: working resolution" bucket the same way BandRole.RESAMPLE does --
-    #: only truly-native bands are exempt.
     role_to_provenance = {
         "native": "native",
-        "pansharpen": "pansharpened",
         "resample": "resampled_for_alignment",
     }
 
@@ -286,21 +285,21 @@ def _resample_dem_to_sensor_grid(
     dst_transform,
     dst_crs: str,
 ) -> np.ndarray:
-    """Reproject one ``(H, W)`` DEM layer from the DEM's own 30 m grid onto a
-    sensor's working-resolution grid (30 m for L5, 15 m for L7/L8/L9, 10 m
-    for S2 -- see ``scenes/band_specs.py``).
+    """Reproject one ``(H, W)`` DEM layer onto a scene's own working-
+    resolution grid, in the rare case the two don't already match exactly.
 
-    The DEM is fetched once per tile at its source's native resolution (30 m
-    MRDEM-30/Copernicus, see ``dem/engine.py``) and never rescaled at fetch
-    time; every later feature stack must land on *that scene's* grid, not
-    the DEM's. Bilinear resampling: elevation/slope are continuous surfaces,
-    and every other continuous-valued raster this pipeline resamples
-    (Landsat 7/8/9 pansharpen-alignment bands) already uses bilinear (see
-    ``scenes/process_scene.py``). Aspect (circular, degrees) is a known
-    exception -- averaging angles that straddle the 0/360 wrap gives a wrong
-    result -- but is accepted here as a documented limitation
-    rather than adding a sin/cos-pair resampling path before any real use
-    case has exercised it.
+    Since the unified-10m-grid revision (see
+    ``docs/decisions/unified_10m_grid.md``), every sensor's scenes are
+    resampled at fetch time directly onto the tile's DEM grid
+    (``scenes/process_scene.py``), so this function is normally a no-op --
+    ``build_feature_stack`` only calls it when a shape mismatch is actually
+    detected (e.g. a scene stored before the revision, or a DEM re-fetched
+    at a different ``target_resolution_m`` after scenes were already
+    stored). Bilinear resampling: elevation/slope are continuous surfaces.
+    Aspect (circular, degrees) is a known exception -- averaging angles that
+    straddle the 0/360 wrap gives a wrong result -- but is accepted here as
+    a documented limitation rather than adding a sin/cos-pair resampling
+    path before any real use case has exercised it.
     """
     from affine import Affine
     from rasterio.crs import CRS
@@ -338,13 +337,11 @@ def build_feature_stack(
     needed so a cached scene can later be written back out as a
     georeferenced raster without reopening the source zarr store.
 
-    DEM layers are resampled onto the scene's own working-resolution grid
-    (see :func:`_resample_dem_to_sensor_grid`) before concatenation -- the
-    DEM is fetched once per tile at its source's native ~30 m resolution
-    (:mod:`landscape_change_detection_pipeline.dem.engine`), which only coincides with
-    Landsat 5's 30 m working grid; every other sensor (L7/L8/L9 at 15 m, S2
-    at 10 m) needs the DEM regridded first or this concatenation raises a
-    shape mismatch.
+    DEM layers are expected to already share the scene's grid exactly (every
+    sensor is resampled onto the tile's DEM grid at fetch time, see
+    ``scenes/process_scene.py`` and ``docs/decisions/unified_10m_grid.md``);
+    :func:`_resample_dem_to_sensor_grid` is only invoked as a fallback when a
+    shape mismatch is actually detected.
     """
     bands, band_provenance = bands_for_scene(tile_dir, tile_id, sensor, scene_id)
     index_stack, index_provenance = compute_indices(bands, band_provenance, names=index_names)

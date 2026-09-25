@@ -9,19 +9,46 @@ sensor-specific module.
 
 Sensors
 -------
-=================  ==========  ======  ==========================
+=================  ==========  ======  ================================
 Sensor             Period      Res.    Collection
-=================  ==========  ======  ==========================
-Landsat 5 TM       1984-2011   30 m    LANDSAT/LT05/C02/T1_TOA
-Landsat 7 ETM+     1999-       30 m    LANDSAT/LE07/C02/T1_TOA
-Landsat 8 OLI      2013-       30 m    LANDSAT/LC08/C02/T1_TOA
-Landsat 9 OLI-2    2021-       30 m    LANDSAT/LC09/C02/T1_TOA
+=================  ==========  ======  ================================
+Landsat 5 TM       1984-2011   10 m    LANDSAT/LT05/C02/T1_TOA
+Landsat 7 ETM+     1999-       10 m    LANDSAT/LE07/C02/T1_TOA
+Landsat 8 OLI      2013-       10 m    LANDSAT/LC08/C02/T1_TOA
+Landsat 9 OLI-2    2021-       10 m    LANDSAT/LC09/C02/T1_TOA
 Sentinel-2 MSI     2015-       10 m    COPERNICUS/S2_HARMONIZED
-=================  ==========  ======  ==========================
+=================  ==========  ======  ================================
 
-All five collections are Collection-2/harmonized **TOA reflectance**, kept
-consistent across sensors so downstream composites and indices are computed
-on the same radiometric basis regardless of which sensor a scene came from.
+All five collections are Collection-2/harmonized **TOA reflectance** (not
+atmospherically corrected Surface Reflectance) -- kept consistent across
+sensors so downstream composites and indices are computed on the same
+radiometric basis regardless of which sensor a scene came from. ``Res.`` is
+the pipeline's uniform working resolution (every sensor resampled onto the
+DEM's exact 10 m grid, see ``docs/decisions/unified_10m_grid.md``), not a
+per-sensor native pixel size -- see :mod:`.band_specs` for the genuine
+per-band native resolution each collection actually provides.
+
+TOA vs. Surface Reflectance
+----------------------------
+This pipeline briefly switched to Surface Reflectance (SR) collections
+(``docs/decisions/unified_10m_grid.md``'s original revision), then rolled
+back to TOA (``docs/decisions/toa_rollback.md``): the SR-derived RGB visual
+composites (:mod:`.composites`) were frequently unusable (black blotches,
+whole-scene color casts) for QA/annotation, and maintaining two parallel
+datasets (TOA + SR) was judged far too heavy in storage for no benefit the
+project actually needed -- TOA already worked well visually and for the
+classifier. Every collection here is therefore back to plain TOA reflectance,
+already in the [0, 1] range as delivered by Earth Engine, no scale/offset
+conversion needed.
+
+Landsat TOA band names are plain ``B1``...``B8`` (``B8`` is the 15 m
+panchromatic band, not stored -- see :mod:`.band_specs`, no pansharpening is
+performed even though a pan band exists in the TOA product: every sensor
+stays on the unified 10 m grid via plain bilinear resample, per
+``docs/decisions/toa_rollback.md``). ``COPERNICUS/S2_HARMONIZED`` uses the
+same ``B1``...``B12``/``B8A`` band names as the SR collection
+(``COPERNICUS/S2_SR_HARMONIZED``) and the same x10000 scale, so nothing
+about Sentinel-2's spec changes between TOA and SR.
 
 Landsat 8 vs. Landsat 9
 ------------------------
@@ -89,14 +116,26 @@ class SensorSpec:
     cloud_cover_property: str
     is_sentinel: bool = False
     #: Divisor turning this collection's raw band values into true [0, 1]
-    #: TOA reflectance. The Landsat Collection-2 T1_TOA collections are
-    #: already scaled to [0, 1] (divisor 1.0); COPERNICUS/S2_HARMONIZED
-    #: stores reflectance x10000 as its raw pixel values (confirmed live,
-    #: 2026-09-18: raw B5-B12 values over the pilot AOI ranged ~90-4400, not
-    #: ~0.01-0.44) -- dividing by this before quantizing to uint16 in
+    #: reflectance: ``reflectance = raw / reflectance_scale_divisor +
+    #: reflectance_scale_offset``. COPERNICUS/S2_HARMONIZED (TOA) stores
+    #: reflectance x10000 as its raw pixel values with no additive offset,
+    #: same convention as its SR counterpart (confirmed live, 2026-09-18: raw
+    #: B5-B12 values over the pilot AOI ranged ~90-4400, not ~0.01-0.44) --
+    #: dividing by this before quantizing to uint16 in
     #: gee_fetch.reflectance_to_uint16 (which itself multiplies by 10000) is
-    #: what keeps stored values in the correct [0, 10000] code range.
+    #: what keeps stored values in the correct [0, 10000] code range. The
+    #: four Landsat TOA collections (``T1_TOA``) need no scale/offset at
+    #: all -- Earth Engine already delivers them as plain [0, 1] float
+    #: reflectance -- so every Landsat ``SensorSpec`` below leaves this at
+    #: its default (``1.0``, a no-op divisor).
     reflectance_scale_divisor: float = 1.0
+    #: Additive term applied *after* dividing by ``reflectance_scale_divisor``
+    #: (see above). Zero for every sensor under TOA (this field exists for
+    #: the scale-**and**-offset convention Landsat Collection 2 Level-2
+    #: *Surface Reflectance* used during this pipeline's brief SR period --
+    #: see ``docs/decisions/toa_rollback.md`` -- and is kept here, defaulted
+    #: to a no-op, rather than removed, in case SR is ever revisited).
+    reflectance_scale_offset: float = 0.0
 
     def years(self, until: Optional[int] = None) -> list[int]:
         """Inclusive list of acquisition years for this sensor."""
@@ -106,7 +145,6 @@ class SensorSpec:
         return list(range(self.first_year, end + 1))
 
 
-#: Landsat Collection 2 Tier 1 TOA, and Sentinel-2 harmonized TOA reflectance.
 SENSORS: dict[str, SensorSpec] = {
     "L5": SensorSpec(
         key="L5",

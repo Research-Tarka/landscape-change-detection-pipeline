@@ -126,6 +126,15 @@ def download_one_tile_all_sensors_years(
     first_year: int = 1984,
     sensors: Optional[Sequence[str]] = None,
     progress_queue=None,
+    harmonization_coefficients: Optional[dict[str, dict[str, tuple[float, float]]]] = None,
+    topo_correction_enabled: bool = False,
+    topo_correction_min_sun_elevation_deg: float = 5.0,
+    topo_correction_reference_band: str = "nir",
+    topo_correction_ratio_clip_min: float = 0.2,
+    topo_correction_ratio_clip_max: float = 5.0,
+    rgb_enabled_views: Optional[set[str]] = None,
+    rgb_asinh_k: float = 8.0,
+    rgb_gamma: float = 1.0 / 2.2,
 ) -> DownloadStats:
     """Discover and fetch every sensor/year's scenes for one tile.
 
@@ -183,7 +192,16 @@ def download_one_tile_all_sensors_years(
 
             for candidate in result.kept:
                 status = process_and_store_scene(
-                    tile_dir, tile_id, sensor_key, candidate.scene_id, window_bbox, crs
+                    tile_dir, tile_id, sensor_key, candidate.scene_id, window_bbox, crs,
+                    harmonization_coefficients=(harmonization_coefficients or {}).get(sensor_key),
+                    topo_correction_enabled=topo_correction_enabled,
+                    topo_correction_min_sun_elevation_deg=topo_correction_min_sun_elevation_deg,
+                    topo_correction_reference_band=topo_correction_reference_band,
+                    topo_correction_ratio_clip_min=topo_correction_ratio_clip_min,
+                    topo_correction_ratio_clip_max=topo_correction_ratio_clip_max,
+                    rgb_enabled_views=rgb_enabled_views,
+                    rgb_asinh_k=rgb_asinh_k,
+                    rgb_gamma=rgb_gamma,
                 )
                 if status == "ok":
                     stats.scenes_ok += 1
@@ -239,6 +257,15 @@ def _run_tile_worker(
     until_year: Optional[int],
     sensors: Optional[Sequence[str]],
     first_year: int = 1984,
+    harmonization_coefficients: Optional[dict[str, dict[str, tuple[float, float]]]] = None,
+    topo_correction_enabled: bool = False,
+    topo_correction_min_sun_elevation_deg: float = 5.0,
+    topo_correction_reference_band: str = "nir",
+    topo_correction_ratio_clip_min: float = 0.2,
+    topo_correction_ratio_clip_max: float = 5.0,
+    rgb_enabled_views: Optional[set[str]] = None,
+    rgb_asinh_k: float = 8.0,
+    rgb_gamma: float = 1.0 / 2.2,
 ) -> None:
     """Entry point run inside each spawned :class:`multiprocessing.Process`.
 
@@ -273,6 +300,15 @@ def _run_tile_worker(
                 first_year=first_year,
                 sensors=sensors,
                 progress_queue=result_queue,
+                harmonization_coefficients=harmonization_coefficients,
+                topo_correction_enabled=topo_correction_enabled,
+                topo_correction_min_sun_elevation_deg=topo_correction_min_sun_elevation_deg,
+                topo_correction_reference_band=topo_correction_reference_band,
+                topo_correction_ratio_clip_min=topo_correction_ratio_clip_min,
+                topo_correction_ratio_clip_max=topo_correction_ratio_clip_max,
+                rgb_enabled_views=rgb_enabled_views,
+                rgb_asinh_k=rgb_asinh_k,
+                rgb_gamma=rgb_gamma,
             )
         result_queue.put(("ok", stats))
     except Exception as exc:  # noqa: BLE001 -- reported to the parent, never fatal
@@ -299,6 +335,15 @@ def run_tiles_multi_process(
     max_attempts: int = MAX_TILE_ATTEMPTS,
     verbose: bool = True,
     worker_target=None,
+    harmonization_coefficients: Optional[dict[str, dict[str, tuple[float, float]]]] = None,
+    topo_correction_enabled: bool = False,
+    topo_correction_min_sun_elevation_deg: float = 5.0,
+    topo_correction_reference_band: str = "nir",
+    topo_correction_ratio_clip_min: float = 0.2,
+    topo_correction_ratio_clip_max: float = 5.0,
+    rgb_enabled_views: Optional[set[str]] = None,
+    rgb_asinh_k: float = 8.0,
+    rgb_gamma: float = 1.0 / 2.2,
 ) -> DownloadStats:
     """Download scenes for many tiles in parallel within one split.
 
@@ -380,6 +425,15 @@ def run_tiles_multi_process(
                 until_year,
                 sensors,
                 first_year,
+                harmonization_coefficients,
+                topo_correction_enabled,
+                topo_correction_min_sun_elevation_deg,
+                topo_correction_reference_band,
+                topo_correction_ratio_clip_min,
+                topo_correction_ratio_clip_max,
+                rgb_enabled_views,
+                rgb_asinh_k,
+                rgb_gamma,
             ),
             daemon=True,
         )

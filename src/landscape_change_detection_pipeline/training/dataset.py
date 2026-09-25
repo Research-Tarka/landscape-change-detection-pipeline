@@ -136,6 +136,22 @@ def group_scenes_by_tile(records: Sequence[SceneRecord]) -> dict[str, list[int]]
     return groups
 
 
+def group_scenes_by_scene_key(records: Sequence[SceneRecord]) -> dict[str, list[int]]:
+    """Map each scene's own ``scene_key`` to its single-element index list.
+
+    Used for ``split.split_by == "scene"``: every downstream stratification/
+    coverage-repair pass in this module operates on "groups" (originally
+    always a tile's scenes) without caring what the group key actually
+    means, so treating each scene as its own singleton group reuses that
+    entire pipeline unchanged -- the resulting "tile_partition" mapping (see
+    :func:`split_scenes`) is then keyed by scene_key instead of tile_id.
+    """
+    groups: dict[str, list[int]] = {}
+    for index, record in enumerate(records):
+        groups.setdefault(record.scene_key, []).append(index)
+    return groups
+
+
 def scene_class_counts(labels: np.ndarray, num_classes: int) -> np.ndarray:
     """Per-class pixel counts for one scene's ``(H, W)`` label array."""
     flat = labels.reshape(-1)
@@ -476,8 +492,10 @@ def split_scenes(
     num_classes: int,
     ratios: tuple[float, float, float] = DEFAULT_RATIOS,
     split_seed: int = 0,
+    split_by: str = "tile",
 ) -> SplitResult:
-    """Split annotated scenes into train/val/test by whole tile.
+    """Split annotated scenes into train/val/test, by whole tile or by
+    individual scene (see ``split_by``).
 
     Parameters
     ----------
@@ -496,17 +514,33 @@ def split_scenes(
     split_seed:
         Seed for the stratified shuffle; the same seed always reproduces the
         same split for the same input records.
+    split_by:
+        ``"tile"`` (default): every scene from one tile lands in the same
+        partition -- the leakage-safe choice, but needs enough tiles for
+        the class-coverage repair passes to have whole units to redistribute.
+        ``"scene"``: splits at the individual-scene level instead (each
+        scene is its own group for stratification/coverage purposes),
+        accepting cross-partition leakage risk between scenes of the same
+        tile in exchange for finer-grained per-partition class coverage --
+        appropriate while the annotated corpus is still small. See
+        ``config.py::SplitConfig.split_by``'s docstring for the full
+        rationale; behaviour is otherwise identical (same stratification,
+        same three coverage-repair passes, same warnings).
 
     Returns
     -------
-    A :class:`SplitResult` with the resulting tile-to-partition assignment,
-    the scenes grouped by partition, and any non-fatal warnings raised by
-    the coverage-repair or proportion-drift checks.
+    A :class:`SplitResult` with the resulting partition assignment (keyed
+    by tile id when ``split_by="tile"``, by scene key when
+    ``split_by="scene"``), the scenes grouped by partition, and any
+    non-fatal warnings raised by the coverage-repair or proportion-drift
+    checks.
     """
     if abs(sum(ratios) - 1.0) > 1e-6:
         raise SplitError(f"ratios must sum to 1.0, got {ratios} (sum={sum(ratios)})")
     if not records:
         raise SplitError("No scene records to split.")
+    if split_by not in ("tile", "scene"):
+        raise SplitError(f"split_by must be 'tile' or 'scene', got {split_by!r}")
 
     _train_ratio, val_ratio, test_ratio = ratios
     records = sorted(records, key=lambda r: r.sort_key)
@@ -517,10 +551,11 @@ def split_scenes(
         for r in records
     ]
 
-    tile_groups = group_scenes_by_tile(records)
+    group_key = (lambda r: r.scene_key) if split_by == "scene" else (lambda r: r.tile_id)
+    tile_groups = group_scenes_by_scene_key(records) if split_by == "scene" else group_scenes_by_tile(records)
     assignment = _stratify_by_size(tile_groups, val_ratio, test_ratio, split_seed)
     if assignment is None:
-        raise SplitError("Could not build a tile-level split (no tiles?).")
+        raise SplitError("Could not build a split (no groups?).")
 
     train, val, test = (list(part) for part in assignment)
 
@@ -534,6 +569,12 @@ def split_scenes(
 
     _check_tile_exclusivity(train, val, test)
     warnings = warnings + _proportion_warnings(train, val, test, tile_groups, val_ratio, test_ratio)
+    if split_by == "scene":
+        warnings = warnings + [
+            "split_by='scene' is active: scenes from the same tile may land in different "
+            "partitions (cross-partition leakage risk), traded for finer-grained per-partition "
+            "class coverage on a small annotated corpus."
+        ]
     for warning in warnings:
         logger.warning("[split] %s", warning)
 
@@ -547,7 +588,7 @@ def split_scenes(
 
     scenes_by_partition: dict[str, list[SceneRecord]] = {p: [] for p in PARTITIONS}
     for record in records:
-        scenes_by_partition[tile_partition[record.tile_id]].append(record)
+        scenes_by_partition[tile_partition[group_key(record)]].append(record)
     for partition in scenes_by_partition:
         scenes_by_partition[partition].sort(key=lambda r: r.sort_key)
 

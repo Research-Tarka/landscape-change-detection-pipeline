@@ -51,9 +51,14 @@ MRDEM_DSM_URL = f"{MRDEM_BASE_URL}/mrdem-30-dsm.tif"
 
 #: Copernicus GLO-30 fallback, via Earth Engine. GLO30 (undated) is
 #: deprecated in favour of the dated collection as of 2026; using the dated
-#: one directly avoids the deprecation warning on every fetch.
+#: one directly avoids the deprecation warning on every fetch. GLO-30's own
+#: *native* pixel spacing is still 30 m -- COPDEM_RESOLUTION_M is the
+#: pipeline's output/reference-grid resolution (config-driven via
+#: ``DemConfig.target_resolution_m``, default 10.0), not a claim that this
+#: source resolves genuine 10 m detail; see
+#: ``docs/decisions/unified_10m_grid.md``.
 COPDEM_COLLECTION = "COPERNICUS/DEM/GLO30_2024_1"
-COPDEM_RESOLUTION_M = 30
+COPDEM_RESOLUTION_M = 10.0
 
 #: Minimum fraction of finite pixels in the fetched window for a source to be
 #: considered usable. Deliberately low: this only screens out windows that
@@ -131,13 +136,18 @@ def load_mrdem_dtm(
     bounds: tuple[float, float, float, float],
     src_crs: int = TARGET_EPSG,
     url: str = MRDEM_DTM_URL,
+    target_resolution_m: float = MRDEM_RESOLUTION_M,
 ) -> Optional[xr.DataArray]:
     """Load MRDEM-30's DTM asset over ``bounds`` (in ``src_crs``).
 
     MRDEM-30 is one nationwide mosaic COG in EPSG:3979, so this is a single
     windowed read -- no STAC search or per-tile mosaicking needed, unlike a
     genuinely tiled product. Returns ``None`` if the window has no usable
-    coverage. The read result is reprojected to :data:`TARGET_EPSG`.
+    coverage. The read result is reprojected to :data:`TARGET_EPSG` at
+    ``target_resolution_m`` -- the pipeline's reference-grid resolution
+    (``DemConfig.target_resolution_m``, default 10.0), not MRDEM-30's own
+    native 30 m pixel spacing; genuine elevation detail is still only ~30 m,
+    see ``docs/decisions/unified_10m_grid.md``.
     """
     configure_gdal_for_public_cogs()
 
@@ -152,7 +162,7 @@ def load_mrdem_dtm(
     if dem is None:
         return None
 
-    if dem.rio.crs.to_epsg() != TARGET_EPSG:
+    if dem.rio.crs.to_epsg() != TARGET_EPSG or target_resolution_m != MRDEM_RESOLUTION_M:
         # An explicit dst transform/shape pins the reprojected grid to the
         # tile's own window bounds: passing only resolution/dst_crs sizes the
         # output to the *rotated* footprint of the source window (EPSG:3979
@@ -160,7 +170,7 @@ def load_mrdem_dtm(
         # larger than the window on each side and leaves most of the array
         # outside it once masked -- confirmed live (a 501x501 window came
         # back ~32-56% valid before this fix, depending on rotation).
-        dst_transform, dst_width, dst_height = _window_transform(bounds, MRDEM_RESOLUTION_M)
+        dst_transform, dst_width, dst_height = _window_transform(bounds, target_resolution_m)
         dem = dem.rio.reproject(
             dst_crs=f"EPSG:{TARGET_EPSG}",
             transform=dst_transform,
@@ -189,6 +199,7 @@ def load_copernicus_dem_gee(
     bounds: tuple[float, float, float, float],
     src_crs: int = TARGET_EPSG,
     collection: str = COPDEM_COLLECTION,
+    target_resolution_m: float = COPDEM_RESOLUTION_M,
 ) -> Optional[xr.DataArray]:
     """Load Copernicus GLO-30 over ``bounds`` (in ``src_crs``) via Earth Engine.
 
@@ -196,6 +207,11 @@ def load_copernicus_dem_gee(
     handed to Earth Engine server-side) -- the same fix documented in
     ``tiles/registry.py`` for the ~1.5 km grid-shift bug at this AOI's
     latitude applies equally here.
+
+    ``target_resolution_m`` is the pipeline's reference-grid resolution
+    (``DemConfig.target_resolution_m``); GLO-30's own native pixel spacing is
+    still 30 m, so a finer target only changes pixel alignment, not genuine
+    resolving power (see ``docs/decisions/unified_10m_grid.md``).
 
     ``Image.getDownloadURL`` returns an authenticated
     ``.../:getPixels`` endpoint, not a plain public URL: GDAL's
@@ -212,7 +228,7 @@ def load_copernicus_dem_gee(
     geom = ee.Geometry.Rectangle(
         list(bounds), proj=f"EPSG:{src_crs}", evenOdd=True, geodesic=False
     )
-    dst_transform, dst_width, dst_height = _window_transform(bounds, COPDEM_RESOLUTION_M)
+    dst_transform, dst_width, dst_height = _window_transform(bounds, target_resolution_m)
     image = ee.ImageCollection(collection).select("DEM").mosaic().clip(geom)
 
     try:
@@ -244,10 +260,12 @@ def load_copernicus_dem_gee(
             data[data == np.float32(src.nodata)] = np.nan
         result = _wrap_array(data, src.transform, src.crs.to_epsg() or src_crs)
 
-    if result.rio.crs.to_epsg() != TARGET_EPSG:
+    if result.rio.crs.to_epsg() != TARGET_EPSG or target_resolution_m != COPDEM_RESOLUTION_M:
+        dst_transform, dst_width, dst_height = _window_transform(bounds, target_resolution_m)
         result = result.rio.reproject(
             dst_crs=f"EPSG:{TARGET_EPSG}",
-            resolution=COPDEM_RESOLUTION_M,
+            transform=dst_transform,
+            shape=(dst_height, dst_width),
             resampling=Resampling.bilinear,
             nodata=np.nan,
         )
@@ -260,32 +278,37 @@ def load_best_dem(
     src_crs: int = TARGET_EPSG,
     use_copernicus_fallback: bool = True,
     force_copernicus: bool = False,
+    target_resolution_m: float = 10.0,
 ) -> tuple[Optional[xr.DataArray], str, int, float]:
     """Try MRDEM-30 DTM first, then Copernicus GLO-30.
 
     Returns ``(dem, source_label, base_resolution_m, valid_pct)``. ``dem`` is
     ``None`` when neither source yields a window with at least
-    :data:`MIN_VALID_PCT` finite pixels.
+    :data:`MIN_VALID_PCT` finite pixels. ``base_resolution_m`` is the
+    *output* grid resolution (``target_resolution_m``, normally
+    ``DemConfig.target_resolution_m``), not necessarily the source's own
+    native pixel spacing -- both MRDEM-30 and Copernicus GLO-30 are natively
+    30 m; see ``docs/decisions/unified_10m_grid.md``.
 
     ``force_copernicus`` skips MRDEM entirely and goes straight to
     Copernicus GLO-30, so the fallback path can be exercised deliberately.
     """
     if not force_copernicus:
         try:
-            dem = load_mrdem_dtm(bounds, src_crs=src_crs)
+            dem = load_mrdem_dtm(bounds, src_crs=src_crs, target_resolution_m=target_resolution_m)
         except Exception:
             dem = None
 
         if dem is not None:
             pct = valid_fraction_pct(dem)
             if pct >= MIN_VALID_PCT:
-                return dem, "MRDEM-30 DTM (NRCan CanElevation, AWS COG)", MRDEM_RESOLUTION_M, pct
+                return dem, "MRDEM-30 DTM (NRCan CanElevation, AWS COG)", target_resolution_m, pct
 
     if not use_copernicus_fallback and not force_copernicus:
         return None, "", 0, 0.0
 
     try:
-        dem = load_copernicus_dem_gee(bounds, src_crs=src_crs)
+        dem = load_copernicus_dem_gee(bounds, src_crs=src_crs, target_resolution_m=target_resolution_m)
     except Exception:
         dem = None
 
@@ -295,4 +318,4 @@ def load_best_dem(
     pct = valid_fraction_pct(dem)
     if pct < MIN_VALID_PCT:
         return None, "", 0, pct
-    return dem, "Copernicus DEM GLO-30 (COPERNICUS/DEM/GLO30_2024_1, GEE)", COPDEM_RESOLUTION_M, pct
+    return dem, "Copernicus DEM GLO-30 (COPERNICUS/DEM/GLO30_2024_1, GEE)", target_resolution_m, pct

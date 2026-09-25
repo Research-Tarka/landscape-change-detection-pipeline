@@ -9,25 +9,25 @@ plus a "stack selected names into one array" entry point (``compute_indices``).
 No pixel loops anywhere -- every index is one numpy expression over whole
 ``(H, W)`` (or higher-dimensional) arrays.
 
-Every index for a given scene runs at that sensor's single uniform working
-resolution (30 m for L5, 15 m for L7/L8/L9, 10 m for S2) -- every band of a
-scene is already aligned onto one grid before this module runs, so there is
-no per-index resolution split here.
+Every index runs on the pipeline's single uniform 10 m grid, pinned to the
+DEM's own exact transform/shape (see ``dem/grid_check.py``'s exact-match
+invariant, now actually enforced at scene-write time rather than just
+documented -- ``docs/decisions/unified_10m_grid.md``) -- every band of a
+scene is already aligned onto that one grid before this module runs, so
+there is no per-index resolution split here.
 
 Provenance
 ----------
-Each *band* is tagged as ``"native"``, ``"pansharpened"``, or
-``"resampled_for_alignment"`` (see ``scenes.zarr_store``'s ``band_provenance``
-attr -- ``"pansharpened"`` there is the ``"resampled_for_alignment"`` case
-called out by the more specific "pansharpen vs plain resample"
-split via ``scenes.band_specs.BandRole``). An index computed from two bands
-inherits the *worse* of its inputs' provenance, using the ordering
-``native < pansharpened < resampled_for_alignment`` (worse = further from
-that grid's genuine native detail): NDSI/NBR/etc. computed from a
-Landsat 7/8/9 SWIR band (plainly resampled, not pansharpened) are tagged
-``"resampled_for_alignment"`` even though they sit on the 15 m working grid,
-so the model/consumer knows not to trust genuine 15 m detail from them. This
-is metadata only -- it never changes how an index is computed.
+Each *band* is tagged as ``"native"`` or ``"resampled_for_alignment"`` (see
+``scenes.zarr_store``'s ``band_provenance`` attr, via
+``scenes.band_specs.BandRole``). An index computed from two bands inherits
+the *worse* of its inputs' provenance, using the ordering
+``native < resampled_for_alignment`` (worse = further from that grid's
+genuine native detail): NDSI/NBR/etc. computed from any Landsat band
+(resampled from ~30 m onto the finer 10 m grid) are tagged
+``"resampled_for_alignment"``, so the model/consumer knows not to trust
+genuine 10 m detail from them. This is metadata only -- it never changes how
+an index is computed.
 """
 
 from __future__ import annotations
@@ -43,8 +43,7 @@ EPS = 1e-6
 _PROVENANCE_RANK = {
     "native": 0,
     "learned_super_resolved": 0,
-    "pansharpened": 1,
-    "resampled_for_alignment": 2,
+    "resampled_for_alignment": 1,
 }
 
 

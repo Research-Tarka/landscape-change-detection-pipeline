@@ -14,15 +14,23 @@ Layout
 ::
 
     <tile_id>.zarr/
-        <sensor>/                      (l5, l7, l8, l9, or s2)
-            toa         (n_scenes, n_bands, H, W)  uint16  nodata=65535
-            rgb_raw     (n_scenes, 3, H, W)         uint8
-            rgb_shadow  (n_scenes, 3, H, W)         uint8
+        <sensor>/                          (l5, l7, l8, l9, or s2)
+            toa                 (n_scenes, n_bands, H, W)  uint16  nodata=65535
+            rgb_true_color      (n_scenes, 3, H, W)         uint8  (optional)
+            rgb_true_color_shadow (n_scenes, 3, H, W)       uint8  (optional)
+            rgb_natural_color   (n_scenes, 3, H, W)         uint8  (optional)
+            rgb_color_infrared  (n_scenes, 3, H, W)         uint8  (optional)
             .attrs:
                 scene_ids: [str, ...]          -- index into the scene axis
                 band_names: [str, ...]         -- index into the band axis
-                band_provenance: {band: "native"|"pansharpened"|"resampled_for_alignment"}
+                band_provenance: {band: "native"|"resampled_for_alignment"}
                 crs_wkt, transform, scale_factor, nodata_value
+
+The four ``rgb_*`` arrays are each optional -- only the composite views
+enabled at scene-storage time (``config.py::RgbCompositesConfig``, see
+:mod:`.composites`) actually get written, so a store may have anywhere from
+zero to four of them depending on what was enabled when its scenes were
+processed.
 
 One chunk per scene (``chunks=(1, n_bands, H, W)`` / ``(1, 3, H, W)``), so
 appending a new scene never rewrites existing chunks. TOA uses the
@@ -41,8 +49,6 @@ from typing import Optional
 import numpy as np
 
 _TOA_ARRAY = "toa"
-_RGB_RAW_ARRAY = "rgb_raw"
-_RGB_SHADOW_ARRAY = "rgb_shadow"
 
 #: One lock per (zarr path, sensor group) pair, so concurrent appends to
 #: *different* tiles/sensors never block each other, while two scenes for the
@@ -114,8 +120,7 @@ def write_scene(
     toa: np.ndarray,
     band_names: list[str],
     band_provenance: dict[str, str],
-    rgb_raw: np.ndarray,
-    rgb_shadow: np.ndarray,
+    rgb_composites: dict[str, np.ndarray],
     transform,
     crs_wkt: str,
     skip_existing: bool = True,
@@ -127,10 +132,15 @@ def write_scene(
     ----------
     toa
         ``(n_bands, H, W)`` uint16, nodata=65535 -- one uniform-resolution
-        array combining every band of this sensor's group (pansharpened,
-        resampled, and native bands alike; see ``band_provenance``).
-    rgb_raw, rgb_shadow
-        ``(3, H, W)`` uint8 visualization composites.
+        array combining every band of this sensor's group (resampled and
+        native bands alike; see ``band_provenance``).
+    rgb_composites
+        ``{view_name: (3, H, W) uint8}`` -- whichever RGB visualization
+        composites were enabled at storage time (see :mod:`.composites`,
+        ``config.py::RgbCompositesConfig``); may be empty. Each named array
+        is appended under its own name, so a store can hold anywhere from
+        zero to four RGB arrays depending on what was enabled when its
+        scenes were processed.
     skip_existing
         If ``True`` (default) and ``scene_id`` is already present in this
         tile/sensor's group, this is a no-op -- the idempotent-append
@@ -154,16 +164,10 @@ def write_scene(
         _append_to_array(
             grp, _TOA_ARRAY, toa[np.newaxis, ...], chunks=(1, n_bands, height, width), compressor=_toa_compressor()
         )
-        _append_to_array(
-            grp, _RGB_RAW_ARRAY, rgb_raw[np.newaxis, ...], chunks=(1, 3, height, width), compressor=_rgb_compressor()
-        )
-        _append_to_array(
-            grp,
-            _RGB_SHADOW_ARRAY,
-            rgb_shadow[np.newaxis, ...],
-            chunks=(1, 3, height, width),
-            compressor=_rgb_compressor(),
-        )
+        for view_name, rgb_arr in rgb_composites.items():
+            _append_to_array(
+                grp, view_name, rgb_arr[np.newaxis, ...], chunks=(1, 3, height, width), compressor=_rgb_compressor()
+            )
 
         attrs = dict(grp.attrs)
         scene_ids = list(attrs.get("scene_ids", []))
@@ -206,10 +210,27 @@ def _append_to_array(grp, name: str, new_slice: np.ndarray, chunks: tuple, compr
     arr[-1:] = new_slice
 
 
+#: Every RGB composite array name this module knows how to read back, if
+#: present -- kept in sync with ``scenes/composites.py::VIEW_BAND_LABELS``'s
+#: keys. A given store may have any subset of these (see :func:`write_scene`).
+RGB_COMPOSITE_ARRAY_NAMES: tuple[str, ...] = (
+    "rgb_true_color",
+    "rgb_true_color_shadow",
+    "rgb_natural_color",
+    "rgb_color_infrared",
+)
+
+
 def read_scene(
     tile_dir: str | Path, tile_id: str, sensor: str, scene_id: str
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Read one scene's ``(toa, rgb_raw, rgb_shadow)`` back by scene id."""
+) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    """Read one scene's ``(toa, rgb_composites)`` back by scene id.
+
+    ``rgb_composites`` is ``{view_name: (3, H, W) uint8}`` for whichever of
+    :data:`RGB_COMPOSITE_ARRAY_NAMES` actually exist in this group -- a
+    store written with fewer views enabled simply has fewer keys, not a
+    fixed-width tuple with missing slots.
+    """
     import zarr
 
     zarr_path = zarr_path_for_tile(tile_dir, tile_id)
@@ -221,11 +242,9 @@ def read_scene(
     if scene_id not in scene_ids:
         raise KeyError(f"Scene '{scene_id}' not found in {zarr_path}/{sensor}")
     idx = scene_ids.index(scene_id)
-    return (
-        np.asarray(grp[_TOA_ARRAY][idx]),
-        np.asarray(grp[_RGB_RAW_ARRAY][idx]),
-        np.asarray(grp[_RGB_SHADOW_ARRAY][idx]),
-    )
+
+    rgb_composites = {name: np.asarray(grp[name][idx]) for name in RGB_COMPOSITE_ARRAY_NAMES if name in grp}
+    return np.asarray(grp[_TOA_ARRAY][idx]), rgb_composites
 
 
 def read_sensor_group_attrs(tile_dir: str | Path, tile_id: str, sensor: str) -> dict:

@@ -14,10 +14,23 @@
 #     into annotation rasters. Splitting a class (e.g. "wetland/riparian"
 #     into finer subclasses) means adding new class entries with
 #     new ids, not editing/removing the old one, so existing annotations
-#     stay valid.
+#     stay valid. Retiring a class means deleting its entry outright, not
+#     reassigning its id to something else -- ids are never reused.
 #   - `change_eligible: false` marks classes that must never count in
 #     change-detection comparisons (cloud, shadow -- these are imaging
 #     artifacts, not land cover).
+#
+# Ids do not need to be contiguous. This file's own history already has a
+# gap (11 and 12 were retired), and any contributor appending/retiring
+# classes over time will keep opening more -- that is expected, not a bug
+# to "fix" by renumbering (which would invalidate every already-painted
+# annotation raster using the old ids). Everywhere a class id sizes or
+# indexes a tensor (the loss, a model's output channel count, a one-hot
+# encoding), the pipeline uses a **dense** id instead -- a class's position
+# in this file's own `classes` list (0..N-1, no gaps by construction) --
+# never the raw `id` field directly. See
+# `classes/class_config.py::ClassConfig`'s docstring
+# (`raw_to_dense`/`dense_to_raw`/`remap_raw_to_dense`) for the mapping.
 #
 # Design notes
 # ------------

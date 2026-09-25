@@ -65,13 +65,20 @@ DEFAULT_MIN_AOI_COVERAGE_PCT = 50.0
 #: Reflectance sanity check (mirrors gee_fetch.py::reflectance_sanity_check):
 #: the brightest pixel over the window must reach at least this TOA
 #: reflectance, or the window is assumed to sit on the swath's fill/no-data
-#: edge rather than containing real surface reflectance.
+#: edge rather than containing real surface reflectance. Tuned for TOA
+#: reflectance (this pipeline's working radiometric basis -- see
+#: ``docs/decisions/toa_rollback.md``).
 DEFAULT_MIN_PLAUSIBLE_REFLECTANCE = 0.15
 
-#: Reflective bands checked by the sanity check, common to all five sensors'
-#: band-naming conventions used here (visible/NIR bands, present natively at
-#: full resolution for every sensor in :mod:`.sensors`).
-SANITY_CHECK_BANDS = ("B3", "B4")
+#: Reflective bands checked by the sanity check. Landsat and Sentinel-2 TOA
+#: collections both use the plain B3 (green for S2 / red for Landsat) / B4
+#: (red for S2 / NIR for Landsat) band names -- one shared pair works for
+#: both sensor families under TOA (unlike the SR collections' Landsat-only
+#: ``SR_B3``/``SR_B4`` naming this pipeline briefly used, see
+#: ``docs/decisions/toa_rollback.md``).
+LANDSAT_SANITY_CHECK_BANDS = ("B3", "B4")
+S2_SANITY_CHECK_BANDS = ("B3", "B4")
+SANITY_CHECK_BANDS = S2_SANITY_CHECK_BANDS
 
 
 @dataclass
@@ -202,13 +209,20 @@ def compute_aoi_coverage_pct(
     return 100.0 * float(ratio)
 
 
+def sanity_check_bands_for_sensor(sensor: SensorSpec) -> tuple[str, ...]:
+    """The green/red (or red/NIR) band pair used by :func:`reflectance_sanity_check`
+    for one sensor, in that sensor's own TOA band-naming convention (both
+    sensor families share plain ``B3``/``B4`` under TOA)."""
+    return S2_SANITY_CHECK_BANDS if sensor.is_sentinel else LANDSAT_SANITY_CHECK_BANDS
+
+
 def reflectance_sanity_check(
     sensor: SensorSpec,
     scene_id: str,
     window_bbox: tuple[float, float, float, float],
     crs: str,
     min_plausible_reflectance: float = DEFAULT_MIN_PLAUSIBLE_REFLECTANCE,
-    bands: tuple[str, ...] = SANITY_CHECK_BANDS,
+    bands: Optional[tuple[str, ...]] = None,
 ) -> bool:
     """Cheap server-side check that a scene has real (non-fill) data over the window.
 
@@ -217,10 +231,15 @@ def reflectance_sanity_check(
     downloaded) over the tile's analysis window, rejecting a scene if the
     brightest pixel across ``bands`` never reaches ``min_plausible_reflectance``
     -- the signature of a swath-edge fill/no-data window passing every
-    metadata-only filter above.
+    metadata-only filter above. ``bands`` defaults to the sensor-appropriate
+    pair (:func:`sanity_check_bands_for_sensor`) when not given explicitly.
+    Landsat TOA is already plain [0, 1] reflectance (no scale/offset);
+    Sentinel-2 TOA is scaled x10000 -- ``min_plausible_reflectance`` is
+    compared against the *converted* max below, not the raw code value.
     """
     import ee
 
+    bands = bands if bands is not None else sanity_check_bands_for_sensor(sensor)
     geometry = build_search_geometry(window_bbox, crs)
     image = ee.Image(f"{sensor.collection}/{scene_id}")
 
@@ -232,7 +251,8 @@ def reflectance_sanity_check(
     max_values = [v for k, v in stats.items() if k.endswith("_max") and v is not None]
     if not max_values:
         return False
-    return max(max_values) >= min_plausible_reflectance
+    converted = max(max_values) / sensor.reflectance_scale_divisor + sensor.reflectance_scale_offset
+    return converted >= min_plausible_reflectance
 
 
 def filter_scenes(

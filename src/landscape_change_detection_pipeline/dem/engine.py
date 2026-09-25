@@ -44,12 +44,17 @@ def process_one_tile(
     overwrite: bool = False,
     copernicus_fallback: bool = True,
     force_copernicus: bool = False,
+    target_resolution_m: float = 10.0,
 ) -> tuple[str, str]:
     """Extract and write the DEM products for one tile.
 
     Returns ``(tile_id, status)`` where status is ``"ok"``, ``"skip (...)"``
     or ``"error (...)"``. Never raises: failures are reported per tile so a
     sweep over ~1000+ tiles is not aborted by one bad window.
+
+    ``target_resolution_m`` (normally ``DemConfig.target_resolution_m``) is
+    the pipeline's reference-grid resolution -- every later sensor scene must
+    land on this exact grid (see ``dem/grid_check.py``).
     """
     tile_dir = Path(tile_dir)
     done_flag = tile_dir / f"{tile_id}{DONE_SUFFIX}"
@@ -62,6 +67,7 @@ def process_one_tile(
             src_crs=TARGET_EPSG,
             use_copernicus_fallback=copernicus_fallback,
             force_copernicus=force_copernicus,
+            target_resolution_m=target_resolution_m,
         )
         if dem is None:
             return tile_id, "skip (no DEM coverage from MRDEM-30 or Copernicus GLO-30)"
@@ -107,6 +113,7 @@ def run_dem_extraction(
     overwrite: bool = False,
     copernicus_fallback: bool = True,
     force_copernicus: bool = False,
+    target_resolution_m: float = 10.0,
 ) -> list[tuple[str, str]]:
     """Run DEM extraction over every tile in ``registry`` (a tile_registry DataFrame).
 
@@ -137,6 +144,7 @@ def run_dem_extraction(
                 overwrite=overwrite,
                 copernicus_fallback=copernicus_fallback,
                 force_copernicus=force_copernicus,
+                target_resolution_m=target_resolution_m,
             )
         )
     return results

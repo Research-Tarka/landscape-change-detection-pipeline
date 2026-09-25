@@ -130,6 +130,25 @@ def main(argv: list[str] | None = None) -> int:
     sensors = args.sensors.split(",") if args.sensors else None
     tile_workers = args.tile_workers if args.tile_workers is not None else sd.tile_workers
 
+    harmonization_coefficients = None
+    if config.harmonization.enabled:
+        harmonization_coefficients = {
+            sensor_key: {label: (c.scale, c.offset) for label, c in bands.items()}
+            for sensor_key, bands in config.harmonization.coefficients.items()
+        }
+
+    rgb_cfg = config.rgb_composites
+    rgb_enabled_views = {
+        view
+        for view, enabled in (
+            ("rgb_true_color", rgb_cfg.true_color_enabled),
+            ("rgb_true_color_shadow", rgb_cfg.true_color_shadow_enabled),
+            ("rgb_natural_color", rgb_cfg.natural_color_enabled),
+            ("rgb_color_infrared", rgb_cfg.color_infrared_enabled),
+        )
+        if enabled
+    }
+
     exit_code = 0
     for split_index in splits:
         project = args.ee_project or (
@@ -160,6 +179,15 @@ def main(argv: list[str] | None = None) -> int:
             sensors=sensors,
             max_workers=tile_workers,
             timeout_s=sd.tile_work_timeout_s,
+            harmonization_coefficients=harmonization_coefficients,
+            topo_correction_enabled=config.topographic_correction.enabled,
+            topo_correction_min_sun_elevation_deg=config.topographic_correction.min_sun_elevation_deg,
+            topo_correction_reference_band=config.topographic_correction.reference_band,
+            topo_correction_ratio_clip_min=config.topographic_correction.ratio_clip_min,
+            topo_correction_ratio_clip_max=config.topographic_correction.ratio_clip_max,
+            rgb_enabled_views=rgb_enabled_views,
+            rgb_asinh_k=rgb_cfg.asinh_k,
+            rgb_gamma=rgb_cfg.gamma,
         )
         print(f"[split {split_index}] {stats.summary()}")
         if stats.tiles_failed or stats.tiles_timed_out:

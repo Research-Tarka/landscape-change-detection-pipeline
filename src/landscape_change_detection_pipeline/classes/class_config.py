@@ -31,6 +31,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 import yaml
 
 DEFAULT_CLASSES_PATH = Path("configs/classes.yaml")
@@ -53,7 +54,23 @@ class ClassDef:
 
 @dataclass(frozen=True)
 class ClassConfig:
-    """The full ordered set of land-cover classes loaded from ``classes.yaml``."""
+    """The full ordered set of land-cover classes loaded from ``classes.yaml``.
+
+    ``ClassDef.id`` (the "raw" id) is stable and never renumbered, so any
+    contributor can append or retire classes over time without disturbing
+    ids already burned into other contributors' annotation rasters -- but
+    that means raw ids are not guaranteed contiguous from 0 (this pipeline
+    has shipped with gaps, e.g. ids 11/12 absent from a 14-class file whose
+    highest id is 15). Every place a class id sizes or indexes a tensor
+    (the loss, a model's output channel count, a one-hot encoding) needs a
+    **dense** id space (0..N-1, no gaps) instead, or a raw id past
+    ``len(classes)`` indexes out of bounds. :attr:`num_model_classes` /
+    :meth:`raw_to_dense` / :meth:`dense_to_raw` provide that mapping
+    (dense index == position in ``classes``, i.e. file order) without
+    requiring raw ids to be contiguous. Model-facing code should use dense
+    ids throughout and only convert back to raw ids at the boundary
+    (reading a painted mask, writing/interpreting a prediction raster).
+    """
 
     classes: tuple[ClassDef, ...]
 
@@ -71,6 +88,49 @@ class ClassConfig:
 
     def change_eligible_ids(self) -> tuple[int, ...]:
         return tuple(c.id for c in self.classes if c.change_eligible)
+
+    @property
+    def num_model_classes(self) -> int:
+        """The dense class count -- always ``len(self.classes)``, since a
+        dense id is a class's position in this tuple, not its raw id."""
+        return len(self.classes)
+
+    @property
+    def _raw_to_dense_map(self) -> dict[int, int]:
+        return {c.id: i for i, c in enumerate(self.classes)}
+
+    @property
+    def _dense_to_raw_map(self) -> dict[int, int]:
+        return {i: c.id for i, c in enumerate(self.classes)}
+
+    def raw_to_dense(self, raw_id: int) -> int:
+        """Map a raw ``ClassDef.id`` (as painted in a mask) to its dense
+        index (0..N-1, this class's position in ``classes``)."""
+        try:
+            return self._raw_to_dense_map[raw_id]
+        except KeyError:
+            raise KeyError(f"No class with raw id={raw_id}") from None
+
+    def dense_to_raw(self, dense_id: int) -> int:
+        """Inverse of :meth:`raw_to_dense`: a model's dense output channel
+        index back to the class's stable raw ``ClassDef.id``."""
+        try:
+            return self._dense_to_raw_map[dense_id]
+        except KeyError:
+            raise KeyError(f"No class with dense id={dense_id}") from None
+
+    def remap_raw_to_dense(self, labels: np.ndarray, nodata_value: int = 255) -> np.ndarray:
+        """Vectorized :meth:`raw_to_dense` over a whole label array.
+
+        Any value not a known raw id (including an existing ``nodata_value``
+        sentinel) maps to ``nodata_value`` in the output -- never silently
+        aliased onto a real dense class id.
+        """
+        raw_to_dense = self._raw_to_dense_map
+        out = np.full(labels.shape, nodata_value, dtype=np.uint8)
+        for raw_id, dense_id in raw_to_dense.items():
+            out[labels == raw_id] = dense_id
+        return out
 
 
 def load_class_config(path: Optional[str] = None) -> ClassConfig:

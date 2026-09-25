@@ -60,11 +60,11 @@ The script also splits tiles into `tiles.n_splits` balanced batches (by count + 
 
 ### 02 -- DEM (`02_download_dem.py`)
 
-For each tile, fetches the best available digital elevation model over its window (MRDEM-30 first, Copernicus GLO-30 fallback where MRDEM has no coverage), computes slope and aspect, and stores everything in the tile's zarr store (`data/tiles/<tile_id>.zarr/dem`). The DEM keeps its source resolution (~30 m) -- it is **not** resampled at this stage (see "Working resolutions and why the DEM is separate" below).
+For each tile, fetches the best available digital elevation model over its window (MRDEM-30 first, Copernicus GLO-30 fallback where MRDEM has no coverage), computes slope and aspect, and stores everything in the tile's zarr store (`data/tiles/<tile_id>.zarr/dem`). The DEM is reprojected onto the pipeline's uniform 10 m reference grid (`dem.target_resolution_m`) at this stage -- it **is** the grid every later sensor scene must land on exactly (see "Working resolution: one unified 10 m grid, pinned to the DEM" below).
 
 ### 03 -- Scene download (`03_download_scenes.py`)
 
-For each tile, searches and downloads scenes from every sensor (Landsat 5/7/8/9, Sentinel-2) across the whole available year range, filtered by cloud cover and AOI coverage. Each sensor is brought to its "working resolution" (see below), with pansharpening for Landsat 7/8/9 and bilinear resampling for Sentinel-2's 20 m bands.
+For each tile, searches and downloads scenes from every sensor (Landsat 5/7/8/9, Sentinel-2) across the whole available year range, filtered by cloud cover and AOI coverage. Every sensor is resampled (bilinear) directly onto the tile's DEM grid (see below) -- there is no pansharpening anywhere in this pipeline: Landsat Collection 2 Level-2 Surface Reflectance carries no panchromatic band at all.
 
 Two layers of parallelism, both real OS processes (never threads -- a real crash was observed with `ThreadPoolExecutor` on GEE calls):
 - **Across batches** (`--split all --parallel`): one subprocess per batch, each with its own GEE project -- this is what actually parallelizes the GEE quota rather than sharing it.
@@ -74,7 +74,7 @@ For a quick test without re-downloading everything, `--first-year`/`--until-year
 
 **Important: Landsat 7 is excluded after 2002.** The Scan Line Corrector failed permanently in May 2003 and was never repaired -- every scene after that date has ~22% of pixels missing in diagonal stripes. The pipeline has no mechanism to fill these gaps, so post-2003 L7 is simply never downloaded.
 
-Result: `data/tiles/<tile_id>.zarr`, one group per sensor (`l5`/`l7`/`l8`/`l9`/`s2`), holding quantized TOA bands plus two RGB composites (Raw and Shadow) for visual annotation.
+Result: `data/tiles/<tile_id>.zarr`, one group per sensor (`l5`/`l7`/`l8`/`l9`/`s2`), holding quantized TOA bands plus RGB composites for visual annotation. Four views are available (`rgb_composites` config), each independently toggleable: `true_color` and `true_color_shadow` (asinh-compressed + gamma-boosted, recovering shadow detail) are on by default; `natural_color` (SWIR2/NIR/red) and `color_infrared` (NIR/red/green, the standard vegetation false-color composite) are off by default until visually validated.
 
 ### Annotation (MaskForge)
 
@@ -84,7 +84,7 @@ This is where the workflow leaves this repo -- annotation happens in MaskForge, 
 
 Once annotated masks are available (written by MaskForge under `data/masks/<tile_id>_<sensor>_<scene_id>/mask.tif`), this script assembles, for each annotated scene, a `(C, H, W)` feature stack -- spectral indices (NDVI, NDSI, NBR, etc.) + DEM layers (elevation, slope, aspect) -- aligned to the scene's grid, and caches it at `data/train_cache/<tile_id>/<sensor>/<scene_id>/features.npz`.
 
-The DEM (stored at its source resolution, ~30 m) is resampled on the fly onto the scene's sensor working grid at this point -- this is where the two resolutions meet. The cache is invalidated automatically if the source (zarr or mask) changes (size+mtime hash), so rerunning this script is always safe and only redoes the necessary work.
+Since every sensor scene already lands exactly on the tile's DEM grid at fetch time (step 03), the DEM layers normally need no further resampling here -- the on-the-fly resample path only fires as a fallback if a shape mismatch is actually detected. The cache is invalidated automatically if the source (zarr or mask) changes (size+mtime hash), so rerunning this script is always safe and only redoes the necessary work.
 
 Each cached scene's `features.npz` is self-contained (features, labels, feature names, and the scene's own georeferencing -- transform + CRS), so it can be handed to someone else without also sending the raw zarr scene store or the MaskForge mask. To merge received training data into your own: copy their `<tile_id>/` folder(s) directly into your `data/train_cache/`. The only requirement is that `tile_id` values never collide between contributors -- see `tiles.tile_id_prefix` in the config, which you should set **before** running `01_build_tiles.py` if you ever intend to share or merge training data (it cannot be changed retroactively without redoing every stage). `tile_id` is otherwise just a row/col index into each contributor's own AOI grid, so two different AOIs will independently produce the same `tile_0000_0000`.
 
@@ -96,11 +96,12 @@ Splits annotated scenes into train/val/test **by whole tile** (never two scenes 
 
 The model and its training hyperparameters (epochs, patience, patch size, etc.) live in the `model`/`training` config sections. The final checkpoint (weights + all metadata needed to rebuild the architecture) is written to `models/checkpoints/<model_type>_best.pt`.
 
-`model.type` is the single switch selecting which of the seven supported model technologies is used; every other subsection of `model` holds that one type's own hyperparameters and is simply ignored when a different type is active:
+`model.type` is the single switch selecting which of the eight supported model technologies is used; every other subsection of `model` holds that one type's own hyperparameters and is simply ignored when a different type is active:
 
 - `threshold` -- spectral-index thresholds tuned by Optuna (`model.threshold`); `sampler="tpe"` for Bayesian search or `sampler="grid"` for a plain exhaustive grid search.
-- `random_forest` -- `sklearn.ensemble.RandomForestClassifier` wrapper (`model.random_forest`), with `class_weight="balanced"` for the uneven class frequencies typical of land cover.
+- `random_forest` -- `sklearn.ensemble.RandomForestClassifier` wrapper (`model.random_forest`), with `class_weight="balanced"` for the uneven class frequencies typical of land cover. No incremental fit, so the full dense pixel matrix must fit in RAM at once -- prefer `lightgbm` on a large training corpus.
 - `catboost` -- CatBoost classifier (`model.catboost`), GPU by default with early stopping.
+- `lightgbm` -- LightGBM classifier (`model.lightgbm`), CPU by default with early stopping; the RAM-conscious alternative to `random_forest` on a large corpus (histogram-binned `Dataset`, no full dense matrix kept resident).
 - `unet` -- U-Net segmentation model (`model.unet`), with optional FiLM spatial/sensor conditioning, bottleneck self-attention, and deep supervision.
 - `deeplabv3plus` -- DeepLabv3+ (`model.deeplabv3plus`), with a configurable ResNet-family backbone, optionally ImageNet-pretrained.
 - `segformer` -- SegFormer (`model.segformer`), with a configurable MiT encoder variant (`mit-b0` through `mit-b5`), optionally pretrained.
@@ -131,7 +132,7 @@ Step 8's counterpart for continuous indices instead of classes -- same crop-and-
 
 ### 11 -- Local CCDC/COLD (`11_run_ccdc.py`)
 
-Per-pixel breakpoint detection (date + per-band magnitude) via `pyxccd` (COLD), run **entirely locally** on this pipeline's own already-pansharpened stored data -- never against raw GEE collections (which would produce breaks on different pixels than the ones the model sees). The cloud/shadow/snow/water mask comes from this pipeline's own classification, not a GEE cloud percentage. LandTrendr was evaluated and dropped (no local alternative exists).
+Per-pixel breakpoint detection (date + per-band magnitude) via `pyxccd` (COLD), run **entirely locally** on this pipeline's own already-resampled-onto-the-DEM's-grid stored data -- never against raw GEE collections (which would produce breaks on different pixels than the ones the model sees). The cloud/shadow/snow/water mask comes from this pipeline's own classification, not a GEE cloud percentage. LandTrendr was evaluated and dropped (no local alternative exists).
 
 CCDC is fit on the six normalized reflectance bands every sensor is aligned to (blue/green/red/nir/swir1/swir2) -- the same per-pixel, multi-decade time series built once per tile on a single shared grid (the finest resolution any sensor ever achieved for that tile). This is **per-scene**, not the monthly index composites from step 9/10: COLD needs one observation per actual scene date to fit its time-series model, so feeding it a pre-aggregated monthly value would throw away the temporal resolution breakpoint detection depends on.
 
@@ -165,17 +166,20 @@ A GUI, not a CLI: `python scripts/export_gui.py` (it relaunches itself under `st
 
 GEE projects are declared once in `gee.projects` (the full list of Earth Engine projects available, to spread load). `scene_download.ee_projects` can stay empty -- in that case download automatically round-robins over `gee.projects`. The number of parallel batches is set via `tiles.n_splits`.
 
-## Working resolutions and why the DEM is separate
+## Working resolution: one unified 10 m grid, pinned to the DEM
 
-Each sensor has its own uniform "working resolution" (all its bands stored on a single grid -- a CNN takes one tensor at a time, resolutions cannot be mixed within a single pass):
+Every sensor -- Landsat 5/7/8/9 and Sentinel-2 alike -- shares one project-wide working resolution, 10 m (`dem.target_resolution_m`), pinned to the exact transform/shape of the tile's own stored DEM:
 
-| Sensor | Working resolution | How it's reached |
-|---|---|---|
-| Landsat 5 | 30 m | native, no processing (TM never had a panchromatic band) |
-| Landsat 7/8/9 | 15 m | Gram-Schmidt Adaptive pansharpening on blue/green/red/NIR (a real detail gain); SWIR1/SWIR2 simply resampled from 30 m to 15 m (alignment only, no invented information) |
-| Sentinel-2 | 10 m | native 10 m bands; 20 m bands (red-edge/SWIR) resampled to 10 m via bilinear interpolation |
+| Sensor | How it reaches the DEM's 10 m grid |
+|---|---|
+| Landsat 5/7/8/9 | native 30 m Surface Reflectance bands, bilinear-resampled directly onto the DEM's grid |
+| Sentinel-2 | native 10 m bands reprojected onto the DEM's grid (no resolution change); 20 m bands (red-edge/SWIR) bilinear-resampled onto the same grid |
 
-The DEM is downloaded **once per tile**, at its source resolution (~30 m) -- there is no per-tile "5 versions of the DEM." It is resampled on the fly onto the relevant sensor's grid when building the training/inference feature stack (`features/training_cache.py::build_feature_stack`), with a provenance tag (`native` or `resampled_for_alignment`) that honestly states whether those DEM pixels are really at that resolution or just resampled from a coarser DEM. This is deliberate: duplicating the DEM into 3 versions per tile would add no real information and would only complicate storage for nothing.
+10 m is Sentinel-2's native ceiling -- nothing in the stack genuinely resolves finer than that -- so this is the best achievable *uniform* resolution, not an arbitrary choice. Every Landsat-derived pixel carries a resolution-semantics caveat: it is genuinely ~30 m information smoothed onto a finer grid, real detail is not being invented, only alignment; never read it as true 10 m resolving power. There is no pansharpening anywhere in this pipeline any more -- Landsat Collection 2 Level-2 Surface Reflectance (the collection this pipeline now uses, see below) carries no panchromatic band at all.
+
+The DEM is fetched **once per tile**, reprojected directly onto this 10 m reference grid (`dem/sources.py`) -- it *is* the grid, not a separate resolution that needs reconciling later. Every later array (every sensor's scenes, every feature stack, every label) is checked against it via `dem/grid_check.py::check_grid_alignment`, called right after each scene is written (`scenes/process_scene.py::process_and_store_scene`); a mismatch is a hard per-scene failure, never a silent pass-through. Band provenance (`native` or `resampled_for_alignment`) still records whether a given band is genuinely native at 10 m (only Sentinel-2's four 10 m bands) or resampled onto the grid.
+
+Every collection is now atmospherically corrected **Surface Reflectance** (SR), not TOA: `LANDSAT/LT05|LE07|LC08|LC09/C02/T1_L2` and `COPERNICUS/S2_SR_HARMONIZED`. See `docs/decisions/unified_10m_grid.md` for the full rationale.
 
 ## MaskForge: annotating from the zarr stores
 
@@ -187,7 +191,7 @@ MaskForge is the annotation tool -- a separate Tauri/React project with a Python
 <tile_id>.zarr!<sensor>/<scene_id_or_index>/<composite>
 ```
 
-where `<composite>` is `rgb_raw`, `rgb_shadow`, or `toa:B4,B3,B2` (any band combination by name).
+where `<composite>` is `rgb_true_color`, `rgb_true_color_shadow`, `rgb_natural_color`, `rgb_color_infrared` (whichever are enabled in `rgb_composites`), or `toa:B4,B3,B2` (any band combination by name).
 
 **To start an annotation session:**
 

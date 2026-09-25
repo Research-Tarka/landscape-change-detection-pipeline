@@ -60,6 +60,7 @@ def main(argv: list[str] | None = None) -> int:
         overwrite=args.overwrite,
         copernicus_fallback=dem_cfg.use_copernicus_fallback,
         force_copernicus=dem_cfg.force_copernicus,
+        target_resolution_m=dem_cfg.target_resolution_m,
     )
 
     n_ok = sum(1 for _, status in results if status == "ok")

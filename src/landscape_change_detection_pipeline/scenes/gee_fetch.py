@@ -98,6 +98,43 @@ def fetch_band_group(
     return arr, transform
 
 
+#: Property names for solar illumination geometry at acquisition time,
+#: confirmed live against the GEE Data Catalog pages for
+#: LANDSAT/LC08/C02/T1_L2 and COPERNICUS/S2_SR_HARMONIZED, 2026-09-25.
+#: Landsat gives elevation (degrees above horizon); Sentinel-2 gives zenith
+#: (degrees from vertical) -- elevation = 90 - zenith, normalized to one
+#: convention by :func:`fetch_scene_solar_angles`.
+LANDSAT_SUN_ELEVATION_PROPERTY = "SUN_ELEVATION"
+LANDSAT_SUN_AZIMUTH_PROPERTY = "SUN_AZIMUTH"
+S2_SOLAR_ZENITH_PROPERTY = "MEAN_SOLAR_ZENITH_ANGLE"
+S2_SOLAR_AZIMUTH_PROPERTY = "MEAN_SOLAR_AZIMUTH_ANGLE"
+
+
+def fetch_scene_solar_angles(collection: str, scene_id: str, is_sentinel: bool) -> dict[str, float]:
+    """Fetch one scene's sun elevation/azimuth (degrees) as scene metadata.
+
+    Returns ``{"sun_elevation_deg": ..., "sun_azimuth_deg": ...}``, one
+    normalized convention (elevation above horizon) regardless of source
+    property -- Sentinel-2 only publishes zenith (from vertical), converted
+    here via ``elevation = 90 - zenith``. Needed for topographic correction
+    (``features/topographic_correction.py``), which needs per-scene solar
+    illumination geometry alongside each tile's own slope/aspect.
+    """
+    import ee
+
+    image = ee.Image(f"{collection}/{scene_id}")
+    if is_sentinel:
+        props = image.select([]).getInfo()["properties"]
+        zenith = float(props[S2_SOLAR_ZENITH_PROPERTY])
+        azimuth = float(props[S2_SOLAR_AZIMUTH_PROPERTY])
+        elevation = 90.0 - zenith
+    else:
+        props = image.select([]).getInfo()["properties"]
+        elevation = float(props[LANDSAT_SUN_ELEVATION_PROPERTY])
+        azimuth = float(props[LANDSAT_SUN_AZIMUTH_PROPERTY])
+    return {"sun_elevation_deg": elevation, "sun_azimuth_deg": azimuth}
+
+
 def resample_band_to_grid(
     array: np.ndarray,
     src_transform,
@@ -108,10 +145,11 @@ def resample_band_to_grid(
 ) -> np.ndarray:
     """Resample a ``(H, W)`` array onto an exact destination grid.
 
-    Used for alignment-only upsampling: Landsat 7/8/9's SWIR1/SWIR2 (30 m ->
-    15 m) and Sentinel-2's 20 m-native bands (20 m -> 10 m), the latter a plain
-    resample rather than DSen2 super-resolution. Never used for the
-    pansharpened bands (see :mod:`.pansharpen`).
+    Used for alignment-only upsampling: every Landsat band (30 m native ->
+    10 m, onto the DEM's exact grid) and Sentinel-2's 20 m-native bands
+    (20 m -> 10 m), the latter a plain resample rather than DSen2
+    super-resolution. There is no pansharpening anywhere in this pipeline
+    (see ``docs/decisions/unified_10m_grid.md``).
     """
     from rasterio.enums import Resampling
     from rasterio.warp import reproject

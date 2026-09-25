@@ -67,3 +67,18 @@ geopandas>=0.14
 # task_type="GPU" to actually run; this project's CatBoostModel deliberately
 # does not fall back to CPU if that fails (see catboost_model.py).
 catboost>=1.2
+
+# LightGBM baseline classifier (landscape_change_detection_pipeline.models.lightgbm_model),
+# added to fix RandomForestModel's RAM blowup on this project's real training
+# corpus (no incremental fit, full dense pixel matrix + bootstrap-tree
+# bookkeeping must be resident at once -- confirmed live saturating 32 GB).
+# Unlike catboost above, the standard `pip install lightgbm` wheel is
+# CPU-only on Windows -- confirmed live, 2026-09-25, on this project's own
+# RTX 5070 Laptop GPU: both device="gpu" and device="cuda" fail outright
+# ("Tree Learner was not enabled in this build"). A from-source build
+# (cmake -DUSE_GPU=1 / -DUSE_CUDA=1) would be needed for GPU acceleration;
+# not currently set up for this project, see lightgbm_model.py's module
+# docstring. Plain pip install, no CUDA-tag-matched index URL needed:
+#
+#   pip install lightgbm
+lightgbm>=4.0
