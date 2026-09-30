@@ -41,7 +41,7 @@ from __future__ import annotations
 
 import logging
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Mapping, Optional, Sequence
 
@@ -70,6 +70,10 @@ class SceneRecord:
     sensor: str
     scene_id: str
     cache_dir: Path
+    #: Optional 256-entry label lookup table (class merging, see
+    #: ``ClassConfig.label_remap_table``) applied whenever this scene's labels
+    #: are read. A tuple so the record stays hashable and cheap to pickle.
+    label_remap: Optional[tuple[int, ...]] = None
 
     @property
     def scene_key(self) -> str:
@@ -125,6 +129,15 @@ def discover_scene_records(train_root: str | Path) -> list[SceneRecord]:
 
     records.sort(key=lambda r: r.sort_key)
     return records
+
+
+def with_label_remap(records: Sequence[SceneRecord], label_remap: Optional[Sequence[int]]) -> list[SceneRecord]:
+    """Copy of ``records`` whose labels are read through ``label_remap``
+    (no-op when ``None``)."""
+    if label_remap is None:
+        return list(records)
+    table = tuple(int(v) for v in label_remap)
+    return [replace(r, label_remap=table) for r in records]
 
 
 def group_scenes_by_tile(records: Sequence[SceneRecord]) -> dict[str, list[int]]:
@@ -628,7 +641,7 @@ def compute_mean_std(train_records: Sequence[SceneRecord]) -> tuple[np.ndarray, 
     count = None
 
     for record in sorted(train_records, key=lambda r: r.sort_key):
-        cache = load_scene_cache(record.cache_dir)
+        cache = load_scene_cache(record.cache_dir, label_remap=record.label_remap)
         features = cache["features"].astype(np.float64)
         c = features.shape[0]
         if n_channels is None:
@@ -667,7 +680,7 @@ def compute_class_counts(train_records: Sequence[SceneRecord], num_classes: int)
     only**. Returns an ``(num_classes,)`` int64 array indexed by class id."""
     counts = np.zeros(num_classes, dtype=np.int64)
     for record in sorted(train_records, key=lambda r: r.sort_key):
-        cache = load_scene_cache(record.cache_dir)
+        cache = load_scene_cache(record.cache_dir, label_remap=record.label_remap)
         counts += scene_class_counts(cache["labels"].astype(np.int64), num_classes)
     return counts
 
@@ -698,6 +711,55 @@ def collect_class_pixel_counts_by_scene(
     Loads each ``.npz`` once, in sorted order."""
     result: dict[str, np.ndarray] = {}
     for record in sorted(records, key=lambda r: r.sort_key):
-        cache = load_scene_cache(record.cache_dir)
+        cache = load_scene_cache(record.cache_dir, label_remap=record.label_remap)
         result[record.scene_key] = scene_class_counts(cache["labels"].astype(np.int64), num_classes)
     return result
+
+
+def scene_sampling_weights(
+    records: Sequence[SceneRecord],
+    class_pixel_counts_by_scene: Mapping[str, np.ndarray],
+    class_counts: np.ndarray,
+    rare_class_threshold: float = 0.02,
+    boost_factor: float = 5.0,
+    rare_classes: Optional[Sequence[int]] = None,
+    presence_min_pixels: int = 0,
+) -> list[float]:
+    """Per-scene sampling weight for :class:`landscape_change_detection_pipeline.training.train.PatchDataset`'s
+    scene draw, in the same order as ``records`` (see
+    :class:`landscape_change_detection_pipeline.config.SceneOversamplingConfig`).
+
+    A class is "rare" when its share of ``class_counts`` (the train-partition
+    corpus total, from :func:`compute_class_counts`) is below
+    ``rare_class_threshold``. Each scene's weight is
+    ``1 + boost_factor * (rare-class pixels in this scene / this scene's
+    total labeled pixels)`` -- a scene made entirely of rare-class pixels
+    gets ``1 + boost_factor`` times a scene with none, and a scene with no
+    labeled pixels at all (denominator 0) gets the baseline weight 1.
+
+    This boosts how often a scene is *drawn*, not the per-pixel loss inside
+    it -- the patches cut from a boosted scene still carry their scene's
+    natural class mix, unlike per-pixel class weighting or a hard-rebalanced
+    sampler, which is the gentler alternative this function exists for (see
+    ``SceneOversamplingConfig``'s docstring).
+    """
+    total = int(class_counts.sum())
+    if total <= 0:
+        return [1.0] * len(records)
+    if rare_classes:
+        rare_classes = {int(c) for c in rare_classes if 0 <= int(c) < len(class_counts)}
+    else:
+        rare_classes = {c for c in range(len(class_counts)) if class_counts[c] / total < rare_class_threshold}
+
+    weights: list[float] = []
+    for record in records:
+        counts = class_pixel_counts_by_scene.get(record.scene_key)
+        if counts is None or counts.sum() <= 0 or not rare_classes:
+            weights.append(1.0)
+            continue
+        rare_pixels = sum(int(counts[c]) for c in rare_classes)
+        rare_share = rare_pixels / int(counts.sum())
+        if presence_min_pixels > 0:
+            rare_share = max(rare_share, min(1.0, rare_pixels / presence_min_pixels))
+        weights.append(1.0 + boost_factor * rare_share)
+    return weights

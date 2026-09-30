@@ -95,7 +95,7 @@ classes:
     display_name: "Recent forest harvest (cutblock -- sharp rectangular geometry, cut timber)"
     color: [176, 124, 60]
     change_eligible: true
-
+  
   - id: 7
     name: burned_disturbed
     display_name: "Burned / fire-disturbed ground (irregular perimeter, ash/char)"

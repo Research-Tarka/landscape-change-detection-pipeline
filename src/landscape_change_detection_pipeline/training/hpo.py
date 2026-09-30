@@ -48,6 +48,7 @@ from typing import Any, Optional
 from landscape_change_detection_pipeline.config import HpoConfig, ModelConfig, TrainingConfig
 from landscape_change_detection_pipeline.training.dataset import SceneRecord
 from landscape_change_detection_pipeline.training.metrics import canonical_main_iou_metric
+from landscape_change_detection_pipeline.training.optuna_utils import build_pruner, build_sampler
 from landscape_change_detection_pipeline.training.train import TrainingResult, train_model
 
 __all__ = ["TrialRecord", "run_trials", "build_sampler", "build_pruner", "sanitise_overrides"]
@@ -155,36 +156,6 @@ def _apply_overrides(
     return new_training_cfg, new_model_cfg
 
 
-def build_sampler(name: str) -> Any:
-    """Build an Optuna sampler. TPE is the default: it models the density of
-    good and bad configurations separately, which suits a small budget over
-    a handful of continuous hyperparameters better than random search."""
-    import optuna
-
-    key = str(name or "tpe").strip().lower()
-    if key == "cmaes":
-        return optuna.samplers.CmaEsSampler()
-    if key == "random":
-        return optuna.samplers.RandomSampler()
-    return optuna.samplers.TPESampler()
-
-
-def build_pruner(name: str, max_resource: Optional[int] = None) -> Any:
-    """Build an Optuna pruner. ``none`` is the reference setting: with only
-    a handful of trials over 2-3 hyperparameters, pruning risks discarding a
-    configuration that starts slow and finishes well."""
-    import optuna
-
-    key = str(name or "none").strip().lower()
-    if key == "median":
-        return optuna.pruners.MedianPruner()
-    if key == "hyperband":
-        return optuna.pruners.HyperbandPruner(
-            min_resource=1, max_resource=max(1, int(max_resource)) if max_resource else "auto"
-        )
-    return optuna.pruners.NopPruner()
-
-
 def run_trials(
     hpo_cfg: HpoConfig,
     training_cfg: TrainingConfig,
@@ -199,6 +170,8 @@ def run_trials(
     feature_names: tuple[str, ...],
     num_sensors: int = 1,
     device: Optional[str] = None,
+    num_spectral_channels: Optional[int] = None,
+    pseudo_label_records: Optional[list[SceneRecord]] = None,
 ) -> tuple[TrainingResult, TrainingConfig, ModelConfig, list[TrialRecord]]:
     """Run the search (if any) and return the final model.
 
@@ -206,11 +179,17 @@ def run_trials(
     trial_records)``. With ``hpo_cfg.trials <= 0`` or an empty search space,
     ``trial_records`` is empty and both winning configs are the ones passed
     in, unchanged.
+
+    ``num_spectral_channels``/``pseudo_label_records`` are forwarded
+    unchanged to every :func:`~landscape_change_detection_pipeline.training.train.train_model`
+    call this makes (trials and the final retrain alike) -- see that
+    function's own docstring.
     """
     if hpo_cfg.trials <= 0 or not hpo_cfg.search_space:
         result = train_model(
             training_cfg, model_cfg, train_records, val_records, mean, std, class_counts,
             num_classes, class_names, feature_names, num_sensors=num_sensors, device=device,
+            num_spectral_channels=num_spectral_channels, pseudo_label_records=pseudo_label_records,
         )
         return result, training_cfg, model_cfg, []
 
@@ -234,8 +213,19 @@ def run_trials(
             result = train_model(
                 trial_training_cfg, trial_model_cfg, train_records, val_records, mean, std, class_counts,
                 num_classes, class_names, feature_names, num_sensors=num_sensors, device=device,
-                progress=False,
+                progress=False, trial=trial,
+                num_spectral_channels=num_spectral_channels, pseudo_label_records=pseudo_label_records,
             )
+        except optuna.TrialPruned:
+            # Re-raised after recording: this is not a failure, but Optuna
+            # itself must still see the exception to mark the trial pruned
+            # in the study (catching it here without re-raising would hide
+            # the pruning from Optuna's own bookkeeping).
+            records.append(
+                TrialRecord(trial_id=trial.number + 1, params=overrides, score=-1e12, pruned=True)
+            )
+            print(f"[hpo] trial {trial.number + 1} pruned")
+            raise
         except Exception as exc:  # noqa: BLE001 - one bad trial must not end the sweep
             records.append(
                 TrialRecord(trial_id=trial.number + 1, params=overrides, score=-1e12, failed=True,
@@ -247,6 +237,10 @@ def run_trials(
         score = float(result.best_state.get("val_metric", float("nan")))
         if not math.isfinite(score):
             score = -1e12
+        print(
+            f"[hpo] trial {trial.number + 1}/{hpo_cfg.trials} finished: "
+            f"{metric_name}={score:.4f} (best epoch {result.best_epoch}/{trial_epochs})"
+        )
         records.append(
             TrialRecord(trial_id=trial.number + 1, params=overrides, score=score, metrics=dict(result.best_state))
         )
@@ -275,5 +269,6 @@ def run_trials(
     final_result = train_model(
         final_training_cfg, final_model_cfg, train_records, val_records, mean, std, class_counts,
         num_classes, class_names, feature_names, num_sensors=num_sensors, device=device,
+        num_spectral_channels=num_spectral_channels, pseudo_label_records=pseudo_label_records,
     )
     return final_result, final_training_cfg, final_model_cfg, records

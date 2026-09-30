@@ -48,8 +48,12 @@ from landscape_change_detection_pipeline.classes.class_config import ClassConfig
 from landscape_change_detection_pipeline.dem.zarr_store import read_tile_dem
 from landscape_change_detection_pipeline.features.spectral_indices import (
     DEM_LAYER_NAMES,
+    DOY_FEATURE_NAMES,
     INDEX_NAMES,
+    LATLON_FEATURE_NAMES,
     compute_indices,
+    doy_cyclical_stack,
+    latlon_stack,
 )
 from landscape_change_detection_pipeline.scenes.band_specs import get_band_spec
 from landscape_change_detection_pipeline.scenes.gee_fetch import uint16_to_reflectance
@@ -69,6 +73,8 @@ from landscape_change_detection_pipeline.scenes.zarr_store import (
 #: them -- those caches must be rebuilt, not reused as-is.
 SCHEMA_VERSION = 2
 CACHE_FILENAME = "features.npz"
+FEATURES_NPY = "features.npy"
+LABELS_NPY = "labels.npy"
 META_FILENAME = "features.json"
 
 #: Landsat scene ids end in an 8-digit acquisition date, e.g.
@@ -210,7 +216,13 @@ def discover_annotated_scenes(mask_root: str | Path) -> list[AnnotatedScene]:
 NODATA_LABEL = 255
 
 
-def read_mask_labels(mask_path: str | Path, class_config: ClassConfig) -> np.ndarray:
+def read_mask_labels(
+    mask_path: str | Path,
+    class_config: ClassConfig,
+    dst_shape: tuple[int, int] | None = None,
+    dst_transform=None,
+    dst_crs=None,
+) -> np.ndarray:
     """Read a MaskForge RGBA mask GeoTIFF/PNG and convert it to a
     ``(H, W)`` uint8 **dense** class-index array (0..N-1, position in
     ``class_config.classes`` -- see ``ClassConfig``'s own docstring for why
@@ -226,11 +238,23 @@ def read_mask_labels(mask_path: str | Path, class_config: ClassConfig) -> np.nda
     as whatever class happens to have dense id 0 (here: forest). 255 is also
     already ``training.losses.IGNORE_INDEX``, so the training loop excludes
     these pixels from the loss/metrics with no further changes needed.
+
+    If ``dst_shape``/``dst_transform``/``dst_crs`` are given and the mask's
+    own grid doesn't already match ``dst_shape``, the dense-label raster is
+    reprojected onto the scene's working-resolution grid with
+    nearest-neighbor resampling (categorical data -- never averaged like the
+    continuous DEM layers, see :func:`_resample_dem_to_sensor_grid`) before
+    being returned, rather than raising on a shape mismatch. Pixels the
+    reprojection doesn't cover (e.g. the mask not fully overlapping the
+    scene) fall back to ``NODATA_LABEL``, same as an unpainted pixel.
     """
     import rasterio
 
     with rasterio.open(mask_path) as src:
         rgba = src.read()  # (4, H, W)
+        src_transform = src.transform
+        src_crs = src.crs
+
     rgba = np.moveaxis(rgba, 0, -1)  # -> (H, W, 4)
 
     h, w = rgba.shape[:2]
@@ -244,6 +268,27 @@ def read_mask_labels(mask_path: str | Path, class_config: ClassConfig) -> np.nda
             & (rgba[:, :, 3] == 255)
         )
         labels[match] = dense_id
+
+    if dst_shape is not None and tuple(labels.shape) != tuple(dst_shape):
+        from affine import Affine
+        from rasterio.crs import CRS
+        from rasterio.enums import Resampling
+        from rasterio.warp import reproject
+
+        destination = np.full(dst_shape, NODATA_LABEL, dtype=np.uint8)
+        reproject(
+            source=labels,
+            destination=destination,
+            src_transform=src_transform,
+            src_crs=src_crs,
+            dst_transform=dst_transform if isinstance(dst_transform, Affine) else Affine(*dst_transform[:6]),
+            dst_crs=CRS.from_user_input(dst_crs),
+            resampling=Resampling.nearest,
+            src_nodata=NODATA_LABEL,
+            dst_nodata=NODATA_LABEL,
+        )
+        labels = destination
+
     return labels
 
 
@@ -328,9 +373,12 @@ def build_feature_stack(
     scene_id: str,
     index_names: tuple[str, ...] = INDEX_NAMES,
     dem_layer_names: tuple[str, ...] = DEM_LAYER_NAMES,
+    include_doy_features: bool = True,
+    include_latlon_features: bool = True,
 ) -> tuple[np.ndarray, list[str], list[str], list[float], str]:
     """Assemble the ``(C, H, W)`` feature stack for one scene: spectral
-    indices followed by DEM layers, in that fixed order. Returns
+    indices, then DEM layers, then (if enabled) acquisition-date and
+    acquisition-location channels, in that fixed order. Returns
     ``(stack, feature_names, feature_provenance, transform, crs_wkt)``, where
     ``transform``/``crs_wkt`` are the scene's own working-resolution grid
     georeferencing (see :func:`landscape_change_detection_pipeline.scenes.zarr_store.transform_to_list`),
@@ -342,9 +390,17 @@ def build_feature_stack(
     ``scenes/process_scene.py`` and ``docs/decisions/unified_10m_grid.md``);
     :func:`_resample_dem_to_sensor_grid` is only invoked as a fallback when a
     shape mismatch is actually detected.
+
+    ``include_doy_features``/``include_latlon_features`` add cyclical
+    day-of-year (``doy_sin``/``doy_cos``) and normalized scene-centroid
+    latitude/longitude (``lat_norm``/``lon_norm``) channels -- constant
+    across a scene's grid, giving the model direct access to seasonality and
+    geography instead of those being folded into the class taxonomy (see
+    ``configs/classes.yaml``'s own design notes) or left for the model to
+    infer from spectral signal alone.
     """
     bands, band_provenance = bands_for_scene(tile_dir, tile_id, sensor, scene_id)
-    index_stack, index_provenance = compute_indices(bands, band_provenance, names=index_names)
+    index_stack, index_provenance = compute_indices(bands, band_provenance, names=index_names, sensor=sensor)
     dst_shape = index_stack.shape[1:]
 
     attrs = read_sensor_group_attrs(tile_dir, tile_id, sensor)
@@ -365,9 +421,22 @@ def build_feature_stack(
         (0, *index_stack.shape[1:]), dtype=np.float32
     )
 
-    stack = np.concatenate([index_stack, dem_stack], axis=0).astype(np.float32)
+    stacks = [index_stack, dem_stack]
     feature_names = [*index_names, *dem_layer_names]
     feature_provenance = [*index_provenance, *dem_provenance]
+
+    if include_doy_features:
+        acquisition_date = scene_date(sensor, scene_id)
+        stacks.append(doy_cyclical_stack(acquisition_date, dst_shape))
+        feature_names.extend(DOY_FEATURE_NAMES)
+        feature_provenance.extend(["native"] * len(DOY_FEATURE_NAMES))
+
+    if include_latlon_features:
+        stacks.append(latlon_stack(dst_transform, dst_crs, dst_shape))
+        feature_names.extend(LATLON_FEATURE_NAMES)
+        feature_provenance.extend(["native"] * len(LATLON_FEATURE_NAMES))
+
+    stack = np.concatenate(stacks, axis=0).astype(np.float32)
     transform_list = dst_transform if isinstance(dst_transform, list) else transform_to_list(dst_transform)
     return stack, feature_names, feature_provenance, transform_list, str(dst_crs)
 
@@ -435,6 +504,8 @@ def write_scene_cache(
     scene_id: str,
     transform: Sequence[float] = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
     crs_wkt: str = "",
+    compress: bool = True,
+    memmap: bool = False,
 ) -> Path:
     """Write one scene's ``.npz`` cache (``features`` float16, ``labels``
     uint8, plus identity metadata and georeferencing) and its ``.json``
@@ -448,15 +519,28 @@ def write_scene_cache(
     "unavailable" sentinels only so existing call sites that predate
     georeferencing keep working -- ``export_annotated_scene`` (the only
     production caller) always passes real values.
+
+    ``compress=False`` writes a plain ``np.savez`` (much faster to read back,
+    larger on disk); :func:`load_scene_cache` reads both transparently.
+
+    ``memmap=True`` additionally stores ``features``/``labels`` as raw
+    ``features.npy``/``labels.npy`` next to the ``.npz`` (which then holds
+    only the metadata), so training can memory-map them and read individual
+    patches without loading or decompressing the whole scene.
     """
     cache_dir.mkdir(parents=True, exist_ok=True)
     npz_path = cache_dir / CACHE_FILENAME
     meta_path = cache_dir / META_FILENAME
 
-    np.savez_compressed(
+    features16 = features.astype(np.float16)
+    labels8 = labels.astype(np.uint8)
+    arrays = {} if memmap else {"features": features16, "labels": labels8}
+    if memmap:
+        np.save(cache_dir / FEATURES_NPY, features16)
+        np.save(cache_dir / LABELS_NPY, labels8)
+    (np.savez_compressed if compress and not memmap else np.savez)(
         npz_path,
-        features=features.astype(np.float16),
-        labels=labels.astype(np.uint8),
+        **arrays,
         sensor=np.array(sensor),
         tile_id=np.array(tile_id),
         year=np.array(year),
@@ -472,7 +556,7 @@ def write_scene_cache(
     return npz_path
 
 
-def load_scene_cache(cache_dir: Path) -> dict:
+def load_scene_cache(cache_dir: Path, mmap: bool = False, label_remap=None) -> dict:
     """Read one scene's ``.npz`` cache back, closing the file handle
     immediately after copying arrays out (so decompression buffers do not
     accumulate across many scenes, mirroring the reference repo's
@@ -481,12 +565,32 @@ def load_scene_cache(cache_dir: Path) -> dict:
     ``transform``/``crs_wkt`` are read with a fallback for caches written
     before georeferencing was added to the schema (``transform`` of all
     zeros / an empty ``crs_wkt`` signal "unavailable" rather than raising).
+
+    When the scene was written with ``memmap=True`` (``features.npy`` /
+    ``labels.npy`` present), ``mmap=True`` returns read-only memory maps
+    instead of loading arrays; otherwise arrays are loaded fully (legacy
+    ``.npz`` caches ignore ``mmap``).
+
+    ``label_remap`` (a 256-entry lookup table, see
+    ``ClassConfig.label_remap_table``) merges classes at read time -- the
+    on-disk cache is never modified. It materialises the (uint8) labels in
+    RAM even when ``mmap=True``; nodata (255) must map to itself.
     """
+    cache_dir = Path(cache_dir)
     npz_path = cache_dir / CACHE_FILENAME
+    has_npy = (cache_dir / FEATURES_NPY).exists() and (cache_dir / LABELS_NPY).exists()
     with np.load(npz_path, allow_pickle=False) as data:
+        if has_npy:
+            mode = "r" if mmap else None
+            features = np.load(cache_dir / FEATURES_NPY, mmap_mode=mode)
+            labels = np.load(cache_dir / LABELS_NPY, mmap_mode=mode)
+        else:
+            features, labels = np.array(data["features"]), np.array(data["labels"])
+        if label_remap is not None:
+            labels = np.asarray(label_remap, dtype=np.uint8)[labels]
         return {
-            "features": np.array(data["features"]),
-            "labels": np.array(data["labels"]),
+            "features": features,
+            "labels": labels,
             "sensor": str(data["sensor"]),
             "tile_id": str(data["tile_id"]),
             "year": int(data["year"]),
@@ -504,12 +608,19 @@ def export_annotated_scene(
     class_config: ClassConfig,
     index_names: tuple[str, ...] = INDEX_NAMES,
     dem_layer_names: tuple[str, ...] = DEM_LAYER_NAMES,
+    include_doy_features: bool = True,
+    include_latlon_features: bool = True,
 ) -> Optional[Path]:
     """Export one annotated scene into its training-cache ``.npz``, skipping
     the rebuild if an up-to-date cache already exists. Returns the ``.npz``
     path, or ``None`` if nothing needed writing."""
     cache_dir = Path(train_root) / scene.tile_id / scene.sensor / scene.scene_id
-    feature_names = [*index_names, *dem_layer_names]
+    feature_names = [
+        *index_names,
+        *dem_layer_names,
+        *(DOY_FEATURE_NAMES if include_doy_features else ()),
+        *(LATLON_FEATURE_NAMES if include_latlon_features else ()),
+    ]
     source_paths = scene_source_paths(tile_dir, scene.tile_id, scene.mask_path)
     signature = scene_cache_signature(scene.scene_key, source_paths, feature_names)
 
@@ -517,14 +628,22 @@ def export_annotated_scene(
         return None
 
     features, feature_names, _provenance, transform, crs_wkt = build_feature_stack(
-        tile_dir, scene.tile_id, scene.sensor, scene.scene_id, index_names, dem_layer_names
+        tile_dir,
+        scene.tile_id,
+        scene.sensor,
+        scene.scene_id,
+        index_names,
+        dem_layer_names,
+        include_doy_features,
+        include_latlon_features,
     )
-    labels = read_mask_labels(scene.mask_path, class_config)
-    if labels.shape != features.shape[1:]:
-        raise ValueError(
-            f"Mask shape {labels.shape} does not match feature grid {features.shape[1:]} "
-            f"for scene '{scene.scene_key}' -- mask and scene are not on the same grid."
-        )
+    labels = read_mask_labels(
+        scene.mask_path,
+        class_config,
+        dst_shape=features.shape[1:],
+        dst_transform=transform,
+        dst_crs=crs_wkt,
+    )
 
     return write_scene_cache(
         cache_dir,
@@ -538,6 +657,7 @@ def export_annotated_scene(
         scene_id=scene.scene_id,
         transform=transform,
         crs_wkt=crs_wkt,
+        memmap=True,
     )
 
 
@@ -548,6 +668,8 @@ def export_all_annotated_scenes(
     class_config: ClassConfig,
     index_names: tuple[str, ...] = INDEX_NAMES,
     dem_layer_names: tuple[str, ...] = DEM_LAYER_NAMES,
+    include_doy_features: bool = True,
+    include_latlon_features: bool = True,
 ) -> list[Path]:
     """Export every MaskForge-annotated scene under ``mask_root`` into
     ``train_root``, in sorted ``(tile_id, sensor, scene_id)`` order. Returns
@@ -555,7 +677,16 @@ def export_all_annotated_scenes(
     skipped and not included."""
     written: list[Path] = []
     for scene in discover_annotated_scenes(mask_root):
-        result = export_annotated_scene(tile_dir, train_root, scene, class_config, index_names, dem_layer_names)
+        result = export_annotated_scene(
+            tile_dir,
+            train_root,
+            scene,
+            class_config,
+            index_names,
+            dem_layer_names,
+            include_doy_features,
+            include_latlon_features,
+        )
         if result is not None:
             written.append(result)
     return written

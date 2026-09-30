@@ -16,14 +16,22 @@ GIS-readable file for a specific period. See
 Usage
 -----
     python scripts/08_build_mosaics.py --config configs/config.yaml
-    python scripts/08_build_mosaics.py --periods 2000-04,2000-12 --overwrite
+
+``periods``/``overwrite``/``workers`` are read from ``config.mosaic`` (see
+:class:`landscape_change_detection_pipeline.config.MosaicConfig`), not CLI
+flags -- a run must be reproducible from ``config.yaml`` alone. Only
+``--config``/``--env-file`` (which config file to read) stay as flags.
 """
 
 from __future__ import annotations
 
 import argparse
 import sys
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
+from typing import Optional
+
+import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -42,9 +50,29 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default=None, help="Path to config.yaml")
     parser.add_argument("--env-file", default=None, help="Path to a .env file")
-    parser.add_argument("--periods", default=None, help="Comma-separated 'YYYY-MM' periods to restrict to")
-    parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args(argv)
+
+
+def _build_one_period(
+    period: str,
+    composites_root: str,
+    output_root: str,
+    registry: pd.DataFrame,
+    overwrite: bool,
+) -> tuple[str, Optional[dict]]:
+    """One period's full load-composites -> mosaic -> write pipeline, run in
+    a worker process. Returns ``(period, result_summary_or_None)`` --
+    ``None`` when skipped (already written, or no tile composite found for
+    this period), so the caller does all printing/counting."""
+    out_path = mosaic_output_path(output_root, period)
+    if out_path.is_file() and not overwrite:
+        return period, None
+    tiles = load_period_tile_composites(composites_root, registry, period)
+    if not tiles:
+        return period, None
+    result = build_period_mosaic(tiles, registry)
+    write_mosaic(out_path, result)
+    return period, {"n_tiles": len(result["tiles_present"]), "resolution_m": result["resolution_m"]}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -56,24 +84,30 @@ def main(argv: list[str] | None = None) -> int:
     registry = read_registry(config.tiles.registry_path)
     tile_ids = registry["tile_id"].tolist()
 
-    periods = args.periods.split(",") if args.periods else discover_periods(comp_cfg.output_root, tile_ids)
+    periods = mosaic_cfg.periods or discover_periods(comp_cfg.output_root, tile_ids)
+
+    common_args = (comp_cfg.output_root, mosaic_cfg.output_root, registry, mosaic_cfg.overwrite)
+
+    def _report(period: str, summary: Optional[dict]) -> bool:
+        if summary is None:
+            return False
+        print(
+            f"[mosaic] {period}: wrote mosaic from {summary['n_tiles']} tiles "
+            f"at {summary['resolution_m']}m"
+        )
+        return True
 
     written = 0
-    for period in periods:
-        out_path = mosaic_output_path(mosaic_cfg.output_root, period)
-        if out_path.is_file() and not args.overwrite:
-            continue
-        tiles = load_period_tile_composites(comp_cfg.output_root, registry, period)
-        if not tiles:
-            print(f"[mosaic] {period}: no tile composites found, skipping")
-            continue
-        result = build_period_mosaic(tiles, registry)
-        write_mosaic(out_path, result)
-        print(
-            f"[mosaic] {period}: wrote mosaic from {len(result['tiles_present'])} tiles "
-            f"at {result['resolution_m']}m -> {out_path}"
-        )
-        written += 1
+    if mosaic_cfg.workers <= 1:
+        for period in periods:
+            period, summary = _build_one_period(period, *common_args)
+            written += int(_report(period, summary))
+    else:
+        with ProcessPoolExecutor(max_workers=mosaic_cfg.workers) as pool:
+            futures = [pool.submit(_build_one_period, period, *common_args) for period in periods]
+            for future in as_completed(futures):
+                period, summary = future.result()
+                written += int(_report(period, summary))
 
     print(f"[mosaic] {written} mosaics written across {len(periods)} periods")
     return 0

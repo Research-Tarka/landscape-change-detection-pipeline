@@ -164,8 +164,13 @@ def predict_scene(
     ambiguity_threshold: float = 0.0,
     priority_order: tuple[int, ...] = DEFAULT_CLASS_PRIORITY_ORDER,
     nodata: int = 255,
+    use_amp: bool = False,
 ):
     """Run sliding-window inference over a full scene.
+
+    ``use_amp`` runs the forward pass under CUDA fp16 autocast (softmax stays
+    fp32) -- noticeably faster on GPU, at a negligible cost in probability
+    precision.
 
     ``features`` is the same ``(C, H, W)`` feature stack
     :mod:`landscape_change_detection_pipeline.features.training_cache` builds for
@@ -217,8 +222,9 @@ def predict_scene(
                 axis=0,
             )
             tensor = torch.from_numpy(batch).to(model_device)
-            logits = model(tensor)
-            probabilities = torch.softmax(logits, dim=1).cpu().numpy()
+            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp and tensor.is_cuda):
+                logits = model(tensor)
+            probabilities = torch.softmax(logits.float(), dim=1).cpu().numpy()
 
             for (r, c), prob in zip(chunk, probabilities):
                 accumulator[:, r : r + patch_size, c : c + patch_size] += prob * weights
@@ -236,6 +242,41 @@ def predict_scene(
 
     if return_probabilities:
         return class_map_full, accumulator
+    return class_map_full
+
+
+def predict_scene_sklearn(
+    model,
+    features: np.ndarray,
+    num_classes: int,
+    valid_mask: Optional[np.ndarray] = None,
+    ambiguity_threshold: float = 0.0,
+    priority_order: tuple[int, ...] = DEFAULT_CLASS_PRIORITY_ORDER,
+    nodata: int = 255,
+):
+    """Run inference for the non-torch model types (threshold, random_forest,
+    catboost, lightgbm) over a full scene.
+
+    Unlike :func:`predict_scene`, there is no sliding window, Hann-weighted
+    overlap-averaging, or mean/std normalization: each of these four model
+    types classifies one pixel at a time from its own feature vector (no
+    receptive field beyond it), and none of them were trained on
+    normalized features (see each model module's own ``_scene_rows``), so
+    applying either would only add cost and, for normalization, actively
+    mismatch what the model was fit on.
+    """
+    features = np.asarray(features, dtype=np.float32)
+    if features.ndim != 3:
+        raise ValueError(f"Expected a (C, H, W) feature stack, got {features.shape}")
+
+    height, width = features.shape[1:]
+    finite = np.all(np.isfinite(features), axis=0)
+
+    probabilities = model.predict_proba(features)
+    class_map = probabilities_to_classes(probabilities, ambiguity_threshold, priority_order).astype(np.uint8)
+    class_map_full = np.where(finite, class_map, nodata).astype(np.uint8)
+    if valid_mask is not None:
+        class_map_full = np.where(np.asarray(valid_mask, dtype=bool)[:height, :width], class_map_full, nodata).astype(np.uint8)
     return class_map_full
 
 

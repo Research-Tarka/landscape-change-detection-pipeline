@@ -21,7 +21,7 @@ from __future__ import annotations
 import json
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Mapping, Optional, Sequence
+from typing import Any, Callable, Mapping, Optional, Sequence
 
 import numpy as np
 import torch
@@ -67,6 +67,23 @@ def _seed_summary(seed: int, result: TrainingResult) -> dict[str, Any]:
     return row
 
 
+def _flatten_eval(eval_by_split: Mapping[str, Mapping[str, Any]]) -> dict[str, float]:
+    """``{split: metrics}`` -> flat numeric row (``val_kappa``, ``test_iou_open_water``...)
+    so the existing mean/std aggregation covers every split and every class."""
+    flat: dict[str, float] = {}
+    for split, metrics in eval_by_split.items():
+        if not metrics:
+            continue
+        macro = metrics.get("macro", {})
+        for key in ("kappa", "mcc", "miou", "miou_weighted", "miou_inv_freq"):
+            if key in macro:
+                flat[f"{split}_{key}"] = macro[key]
+        for entry in metrics.get("per_class", []):
+            for key in ("iou", "precision", "recall"):
+                flat[f"{split}_{key}_{entry['class_name']}"] = entry[key]
+    return flat
+
+
 def run_bootstrap(
     bootstrap_cfg: BootstrapConfig,
     hpo_cfg: HpoConfig,
@@ -83,10 +100,20 @@ def run_bootstrap(
     run_root: str | Path,
     num_sensors: int = 1,
     device: Optional[str] = None,
+    num_spectral_channels: Optional[int] = None,
+    pseudo_label_records: Optional[list[SceneRecord]] = None,
+    evaluate_fn: Optional[Callable[[Any], dict[str, Any]]] = None,
 ) -> Path:
     """Train ``bootstrap.n_seeds`` models (each optionally HPO-tuned) and
     summarise the spread. Returns the run directory holding
-    ``seed_*/checkpoint.pt``, ``ensemble/``, and the summary files."""
+    ``seed_*/checkpoint.pt``, ``ensemble/``, and the summary files.
+
+    ``evaluate_fn(model)``, when given, returns ``{split: metrics}`` (train /
+    val / test, each a :func:`compute_confusion_metrics` dict plus its
+    confusion matrix); it is run per seed, written to
+    ``seed_*/seed_report.json`` together with that seed's HPO trials and
+    training history, and its kappa/MCC/mIoU/per-class values are aggregated
+    (mean +/- std) across seeds."""
     run_root = Path(run_root)
     run_root.mkdir(parents=True, exist_ok=True)
 
@@ -107,9 +134,10 @@ def run_bootstrap(
         seed_cfg = training_cfg.model_copy(update={"seed": seed})
 
         try:
-            result, _winning_training_cfg, winning_model_cfg, _trials = run_trials(
+            result, _winning_training_cfg, winning_model_cfg, trials = run_trials(
                 hpo_cfg, seed_cfg, model_cfg, train_records, val_records, mean, std, class_counts,
                 num_classes, class_names, feature_names, num_sensors=num_sensors, device=device,
+                num_spectral_channels=num_spectral_channels, pseudo_label_records=pseudo_label_records,
             )
         except Exception as exc:  # noqa: BLE001 - report and continue the sweep
             print(f"[bootstrap] seed {seed} failed: {exc}")
@@ -125,13 +153,44 @@ def run_bootstrap(
         seed_dir.mkdir(parents=True, exist_ok=True)
         save_checkpoint(seed_dir / "checkpoint.pt", result.model, meta)
 
-        summaries.append(_seed_summary(seed, result))
+        row = _seed_summary(seed, result)
+        eval_by_split: dict[str, Any] = {}
+        if evaluate_fn is not None:
+            try:
+                eval_by_split = evaluate_fn(result.model)
+                row.update(_flatten_eval(eval_by_split))
+            except Exception as exc:  # noqa: BLE001 - a failed evaluation must not lose the trained seed
+                print(f"[bootstrap] seed {seed} evaluation failed: {exc}")
+                row["eval_error"] = str(exc)
+        summaries.append(row)
+        (seed_dir / "seed_report.json").write_text(
+            json.dumps(
+                {
+                    "seed": seed,
+                    "summary": row,
+                    "eval": eval_by_split,
+                    "hpo_trials": [
+                        {"trial_id": t.trial_id, "params": t.params, "score": t.score,
+                         "pruned": t.pruned, "failed": t.failed, "error": t.error}
+                        for t in trials
+                    ],
+                    "winning_training": _winning_training_cfg.model_dump(mode="json"),
+                    "winning_model": winning_model_cfg.model_dump(mode="json"),
+                    "history": result.history,
+                    "class_counts": [int(c) for c in class_counts],
+                },
+                indent=2,
+                default=str,
+            ),
+            encoding="utf-8",
+        )
         if result.best_state.get("model") is not None:
             state_dicts.append(result.best_state["model"])
 
     ensemble_path = build_ensemble(state_dicts, run_root / "ensemble") if bootstrap_cfg.create_ensemble else None
 
-    aggregate = _aggregate(summaries)
+    extra_keys = sorted({k for row in summaries for k in row if k not in AGGREGATE_METRICS})
+    aggregate = _aggregate(summaries, (*AGGREGATE_METRICS, *extra_keys))
     (run_root / "bootstrap_summary.json").write_text(
         json.dumps(
             {

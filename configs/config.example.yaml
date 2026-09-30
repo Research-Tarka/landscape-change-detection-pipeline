@@ -103,6 +103,8 @@ topographic_correction:
 # ----------------------------------------------------------------------
 features:
   train_root: data/train_cache          # one .npz/.json cache pair per annotated scene
+  # scripts/convert_cache_to_memmap.py: parallel processes (each holds one scene in RAM).
+  convert_workers: 4
   mask_root: data/masks                 # MaskForge's SaveConfig.output_root -- {tile_id}_{sensor}_{scene_id}/mask.tif
   # Where scripts/export_georeferenced_cache.py writes standalone georeferenced
   # GeoTIFFs (features.tif + labels.tif per scene) reconstructed from train_root.
@@ -111,21 +113,40 @@ features:
   # pipeline needed to use it.
   geotiff_export_root: data/train_geotiff
 
-  # Which features actually go into the model's input stack, in this order.
-  # null (default) = use every available name. List a subset to disable the
-  # rest, e.g. to train on the 11 spectral indices only, set
-  # dem_layer_names: [] and leave index_names as null (or list all 11).
-  #
-  # Available index_names: NDVI, NDSI, NDWI_GAO, NBR, ND_SWIR1_SWIR2,
-  #   ND_BLUE_RED, ND_BLUE_NIR, ND_GREEN_RED, r, g, b
-  # Available dem_layer_names: elevation, slope, aspect
-  #
-  # Changing either list changes the model's input channel count -- retrain
-  # (scripts/05_train_model.py) whenever you change this, and re-export the
-  # training cache first (scripts/04_export_training_cache.py) since cached
-  # .npz files store the feature stack that was active when they were built.
-  index_names: [NDVI, NDSI, NDWI_GAO, NBR, ND_SWIR1_SWIR2, ND_BLUE_RED, ND_BLUE_NIR, ND_GREEN_RED, r, g, b]                     # e.g. [NDVI, NDSI, NDWI_GAO, NBR, ND_SWIR1_SWIR2, ND_BLUE_RED, ND_BLUE_NIR, ND_GREEN_RED, r, g, b]
-  dem_layer_names: [elevation, slope, aspect]                 # e.g. [] to disable DEM layers entirely, or [elevation, slope, aspect] for all
+  # Spectral input variables, in model-input order. Active = plain line,
+  # available-but-off = commented with #. Changing this changes the model's
+  # input channel count: re-export the cache (04) and retrain (05).
+  index_names:
+    - NDVI                # (nir - red) / (nir + red)
+    - NDSI                # (green - swir1) / (green + swir1)  [= MNDWI]
+    - NDWI_GAO            # (nir - swir1) / (nir + swir1)      [= -NDBI]
+    - NBR                 # (nir - swir2) / (nir + swir2)
+    - ND_SWIR1_SWIR2      # (swir1 - swir2) / (swir1 + swir2)  [= NBR2]
+    - ND_BLUE_RED
+    - ND_BLUE_NIR
+    - ND_GREEN_RED
+    - r                   # chromaticity red / (r+g+b)
+    - g
+    - b
+    - BSI                 # bare soil index: bare/sand/rock/built vs vegetation
+    - NDWI_MCFEETERS      # (green - nir) / (green + nir): open water
+    - EVI                 # enhanced vegetation index (dense canopy, aerosols)
+    - TC_BRIGHTNESS       # Tasseled Cap, per-sensor coefficients (L5/L7/L8/L9/S2)
+    - TC_GREENNESS
+    - TC_WETNESS
+    # - NDBI              # redundant: exactly -NDWI_GAO
+    # - SAVI              # soil-adjusted vegetation index (arid); overlaps EVI/NDVI
+  dem_layer_names: [elevation, slope, aspect]
+
+  # Extra scene-wide channels appended after the DEM layers, so the model
+  # sees seasonality/geography directly instead of that being folded into
+  # the class taxonomy (configs/classes.yaml) or left for the model to infer
+  # from spectral signal alone. Both default to true. Changing either
+  # changes the model's input channel count -- re-export the training cache
+  # (scripts/04_export_training_cache.py) and retrain (scripts/05_train_model.py)
+  # after changing.
+  include_doy_features: true            # adds doy_sin/doy_cos (cyclical day-of-year, from each scene's acquisition date)
+  include_latlon_features: false        # adds lat_norm/lon_norm (each scene's centroid, normalized to roughly [-1, 1])
 
 # ----------------------------------------------------------------------
 # Train/val/test split
@@ -133,6 +154,7 @@ features:
 split:
   ratios: [0.7, 0.15, 0.15]             # [train, val, test], must sum to 1.0
   split_seed: 0                         # seeded stratified shuffle -> reproducible split
+  split_by: scene                       # tile (default, leakage-safe) | scene -- scene allows scenes from the same tile to land in different partitions
   drift_tolerance: 0.25                 # warn (never fail) if a partition's actual ratio drifts more than this fraction of target
   split_assignment_path: data/train_cache/split_assignment.json
 
@@ -190,12 +212,27 @@ model:
 
   # -- type: catboost ---------------------------------------------------------
   catboost:
-    iterations: 1000                    # upper bound; early_stopping_rounds usually stops sooner
+    iterations: 1000                    # final refit's upper bound; early_stopping_rounds usually stops sooner
     learning_rate: 0.05
     depth: 8
     task_type: GPU                      # GPU | CPU -- set to CPU on a machine without a CUDA GPU
     random_state: 0
-    early_stopping_rounds: 50
+    early_stopping_rounds: 50           # final refit only
+    class_weighting: true               # inverse-frequency class weights -- rare classes learn poorly without this
+    # n_trials > 0 runs an Optuna search (learning_rate, depth, l2_leaf_reg):
+    # each trial is fit cheaply at search_iterations, then the winning
+    # params are refit once at this section's own `iterations` (the real,
+    # full budget) -- "lots of cheap trials, then one real run" in one knob.
+    # n_trials: 30
+    # sampler: tpe                      # tpe | cmaes | random
+    # pruner: none                      # none | median | hyperband -- hyperband cuts a bad
+    #                                    # trial early from its per-round eval-set loss.
+    #                                    # CPU only: CatBoost supports neither pruning
+    #                                    # callbacks nor resumable fitting on GPU, so with
+    #                                    # task_type=GPU every trial still runs to completion
+    #                                    # regardless of this setting (a warning is logged).
+    # search_iterations: 500            # per-trial cap during the search (keep low: cheap exploration)
+    # search_early_stopping_rounds: 30
 
   # -- type: lightgbm -----------------------------------------------------
   # device: cpu is the confirmed-working default -- the standard `pip install
@@ -206,12 +243,23 @@ model:
   lightgbm:
     num_leaves: 31
     learning_rate: 0.05
-    n_estimators: 1000                  # upper bound; early_stopping_rounds usually stops sooner
+    n_estimators: 1000                  # final refit's upper bound; early_stopping_rounds usually stops sooner
     max_depth: -1                       # -1 = unlimited depth
     min_data_in_leaf: 20
     device: cpu                         # cpu | gpu | cuda -- see note above
     random_state: 0
-    early_stopping_rounds: 50
+    early_stopping_rounds: 50           # final refit only
+    class_weighting: true               # inverse-frequency class weights -- rare classes learn poorly without this
+    # n_trials > 0 runs an Optuna search (learning_rate, num_leaves,
+    # min_data_in_leaf): each trial is fit cheaply at search_n_estimators,
+    # then the winning params are refit once at this section's own
+    # `n_estimators` (the real, full budget), scored by macro mIoU on val_records:
+    # n_trials: 30
+    # sampler: tpe                      # tpe | cmaes | random
+    # pruner: none                      # none | median | hyperband -- hyperband cuts a bad
+    #                                    # trial early from its per-round eval-set metric
+    # search_n_estimators: 500          # per-trial cap during the search (keep low: cheap exploration)
+    # search_early_stopping_rounds: 30
 
   # -- type: unet ---------------------------------------------------------
   unet:
@@ -244,12 +292,12 @@ model:
 # ----------------------------------------------------------------------
 training:
   epochs: 100
-  batch_size: 16
+  batch_size: 32
   patch_size: 256                       # must be <= the smallest tile's grid size for that sensor, or scenes get reflect-padded up to it
   lr: 0.0003
   weight_decay: 0.0001
-  patience: 15                          # epochs without improvement before early stopping
-  num_workers: 4
+  patience: 30                          # epochs without improvement before early stopping
+  num_workers: 16                       # CPU-bound data loading is the bottleneck (GPU 20-30%, CPU ~90% even at num_workers=10) -- raise toward core count minus a couple reserved for the main process, watch RAM (each worker holds its own copy of every loaded scene)
   seed: 0
   deterministic: false                  # true pins cuDNN to deterministic algorithms (slower, exactly reproducible)
   amp: true                             # mixed precision (only takes effect on CUDA)
@@ -257,6 +305,18 @@ training:
   main_iou_metric: miou_macro           # miou_macro | miou_weighted | miou_inv_freq -- drives early stopping
   augment_flips: true
   augment_rotate90: true
+  # Merge classes (source: target, names from classes.yaml). Source pixels are
+  # relabelled as the target when scenes are read (caches on disk untouched);
+  # predictions of a source class are folded onto the target at evaluation,
+  # pseudo-labeling and inference. Also remove merged classes from the
+  # rare_classes lists below (a warning is printed otherwise). {} = off.
+  class_merge:
+    built_up_infrastructure: bare_ground   # 1-2 px objects: below sensor resolution, never learned
+  class_weighting: true                 # inverse-frequency class weights in the loss -- rare classes learn poorly without this
+  class_weight_power: 0.5               # weight = inverse_freq ** power; 1.0 = plain (can reach x100+ and break training), 0.5 = sqrt
+  class_weight_max: 10.0                # cap on any single class weight; null = no cap
+  focal_gamma: 0.0                      # focal loss: 0 = off, 2 = usual. Focuses the gradient on hard/rare pixels
+  dice_weight: 0.0                      # soft-Dice term added to the loss: 0 = off, 0.5-1.0 typical. Every class counts equally
   checkpoint_dir: models/checkpoints
   # Optional directional confusion penalties added to the loss, e.g. to
   # extra-penalize predicting "open_water" (class 7) wherever the truth is
@@ -265,6 +325,53 @@ training:
   # training.losses.ConfusionPenalty). true_class: null means "any class
   # other than predicted_class".
   confusion_penalties: []               # e.g. [{true_class: 6, predicted_class: 7, beta: 1.0}]
+
+  # Radiometric jitter (per-patch brightness/contrast shift + per-pixel
+  # Gaussian noise) applied only to the spectral-index channels of a
+  # training patch -- never to DEM/day-of-year/lat-lon channels, which have
+  # no radiometric meaning. Off by default; on top of the geometric
+  # augmentation (augment_flips/augment_rotate90) above when enabled.
+  radiometric_augmentation:
+    enabled: false
+    brightness_std: 0.05                # additive jitter std, in normalized (post train mean/std) units
+    contrast_std: 0.05                  # multiplicative jitter std around each channel's own mean
+    noise_std: 0.02                     # i.i.d. Gaussian pixel noise std, same normalized units
+
+  # Class-driven per-scene oversampling: draws a scene more often in
+  # proportion to its share of rare-class pixels, without changing the
+  # per-pixel loss (unlike class_weighting) or the natural class mix inside
+  # a drawn patch. A gentler alternative to try first if class_weighting has
+  # destabilized training (see TrainingConfig's own docstring).
+  scene_oversampling:
+    enabled: false
+    rare_class_threshold: 0.02          # a class below this corpus-wide pixel share counts as "rare"
+    boost_factor: 5.0                   # a scene made entirely of rare-class pixels is drawn (1+this) times as often
+    rare_classes: [5, 7, 9]             # DENSE ids: open_water, burned_disturbed, ice_cover; [] = use rare_class_threshold (never list a class merged by class_merge)
+    presence_min_pixels: 0              # e.g. 2000: a scene with >= this many rare pixels counts as fully rare (else share is tiny)
+
+  # Semi-supervised self-training over the large unlabeled scene pool under
+  # dem.tile_dir (data/tiles is typically far bigger than what fits in RAM,
+  # hence a separate streaming script rather than loading it like
+  # train_root). Workflow: train once normally, run
+  # scripts/05b_generate_pseudo_labels.py against that checkpoint to write
+  # confidence-thresholded pseudo-labels to pseudo_label_root, then set
+  # enabled: true and retrain/fine-tune -- pseudo-labeled scenes are mixed
+  # into training at reduced sampling and loss weight.
+  pseudo_label:
+    enabled: false
+    pseudo_label_root: data/pseudo_label_cache
+    confidence_threshold: 0.9           # only pixels with max-softmax >= this are kept as pseudo-labels
+    max_scenes: null                    # cap how many unlabeled scenes to score per run; null = no cap
+    sensors: null                       # restrict pseudo-labeling to these sensors, e.g. [l8, s2]; null = all
+    inference_batch_size: 32            # patches per inference batch when streaming an unlabeled scene
+    inference_stride: null              # null = patch_size (no overlap, ~4x faster); set e.g. 128 for smoother output
+    use_amp: true                       # fp16 autocast on GPU
+    prefetch_workers: 3                 # threads preloading next scenes while the GPU infers
+    rare_classes: [5, 7, 9]             # DENSE ids to favour (never list a class merged by class_merge)
+    rare_confidence_threshold: 0.7      # lower threshold applied to rare classes
+    min_rare_pixels: 500                # keep a scene with >= this many rare pixels even if few pixels pass overall
+    pseudo_label_weight: 0.3            # pseudo-labeled scenes are drawn at this fraction of a real scene's rate
+    pseudo_label_loss_weight: 0.5       # scales a pseudo-labeled patch's contribution to the loss
 
 # ----------------------------------------------------------------------
 # Optuna HPO
@@ -328,6 +435,17 @@ inference:
   # project).
   ambiguity_threshold: null
   class_priority_order: []              # empty = use the built-in default order (see inference/engine.py::DEFAULT_CLASS_PRIORITY_ORDER); or e.g. [7, 6, 8, 11, 9, 10, 5, 4, 3, 0, 1, 2, 12, 13] to override
+  checkpoint_path: null                  # null = <training.checkpoint_dir>/<model.type>_best.<pt|joblib>
+  tiles: []                              # empty = every tile in the registry
+  sensors: []                            # empty = every sensor (l5, l7, l8, l9, s2)
+  device: null                           # null = auto-detect (cuda if available, else cpu)
+  # Worker processes for scripts/06_run_inference.py (feature-stack build +
+  # inference, parallelized per scene). 1 = sequential. Keep this small for a
+  # GPU-backed model type (e.g. catboost with task_type=GPU) -- concurrent
+  # processes contend for the same GPU past a point instead of adding real
+  # throughput -- and raise it gradually while comparing wall-clock time
+  # rather than jumping straight to the machine's full core count.
+  workers: 1
 
 # ----------------------------------------------------------------------
 # Monthly composites
@@ -338,12 +456,6 @@ composites:
   # Per-class override of default_rule. class_id values below match this
   # project's own configs/classes.yaml -- adjust to your own taxonomy.
   class_rules:
-    - class_id: 6   # cutblock_harvest: durable event, wins outright if seen even once in the month
-      rule: any_occurrence
-      priority: 1
-    - class_id: 7   # burned_disturbed: durable event, wins outright if seen even once in the month
-      rule: any_occurrence
-      priority: 2
     - class_id: 9   # ice_cover: transient, fills in only if nothing else won the month's majority; beats snow
       rule: fallback_occurrence
       priority: 1
@@ -351,6 +463,9 @@ composites:
       rule: fallback_occurrence
       priority: 2
   output_root: outputs/composites
+  tiles: []                              # empty = every tile in the registry
+  overwrite: false
+  workers: 1                             # CPU-only, no GPU contention here -- can scale close to core count
 
 # ----------------------------------------------------------------------
 # AOI-wide mosaicking
@@ -363,61 +478,230 @@ composites:
 # ----------------------------------------------------------------------
 mosaic:
   output_root: outputs/mosaics
+  periods: []                            # empty = every period with at least one tile composite
+  overwrite: false
+  workers: 1                             # CPU-only, no GPU contention here -- can scale close to core count
 
 # ----------------------------------------------------------------------
-# Monthly per-tile spectral-index composites (change-detection analysis
-# only -- never fed to the land-cover model)
-# ----------------------------------------------------------------------
-index_composites:
-  output_root: outputs/index_composites
-
-# ----------------------------------------------------------------------
-# AOI-wide spectral-index mosaics
-# ----------------------------------------------------------------------
-index_mosaic:
-  output_root: outputs/index_mosaics
-
-# ----------------------------------------------------------------------
-# Local CCDC/COLD change detection
+# Per-pixel temporal segmentation (break dates, trends, seasonality)
 # Runs entirely locally on this pipeline's own stored, already-classified
-# scenes -- never against Earth Engine's raw collections.
+# scenes. Splits every pixel's multi-decade time series of the configured
+# spectral indices into stable segments separated by detected breaks; each
+# segment carries its fitted level/trend/seasonal amplitude/peak-day per
+# feature and its dominant land-cover class.
 # ----------------------------------------------------------------------
-ccdc:
-  lam: 20.0                             # Lasso regularization weight (pyxccd default; 20 for [0,10000]-scaled reflectance)
-  p_cg: 0.99                            # change-magnitude probability threshold
-  conse: 6                              # consecutive observations needed to confirm a break
-  min_clear_obs: 12                     # minimum clear (non-cloud/shadow) observations to attempt a fit
-  n_workers: 1                          # CPU processes to spread pixels across (never GPU -- no CUDA path exists)
-  output_root: outputs/ccdc
+change_detection:
+  output_root: outputs/change_detection
+  tiles: []                              # empty = every tile in the registry
+  overwrite: false
+  start_year: 1984                       # earliest observation year to include
+  end_year: null                         # null = up to the latest stored scene
+  # Spectral indices the time series is built from (features.spectral_indices/
+  # change.analysis_indices names) -- NBR and NDVI are required (burn severity
+  # and vegetation-state layers read them directly).
+  features: [NBR, NDVI, NDWI_GAO, TC_BRIGHTNESS]
+  # Classes whose observations are excluded entirely (not usable land-surface
+  # signal, not "changed").
+  masked_classes: [cloud, shadow, snow_cover, ice_cover, open_water]
+  p_change: 0.999                         # chi-square probability level of the per-observation change test
+  conse: 4                               # consecutive exceeding observations required to confirm a break
+  init_obs: 18                           # minimum clear observations in a segment's initial window
+  init_min_span_days: 365                # minimum calendar span (days) of the initial window
+  stability_threshold: 3.0               # max trend/end-residual (in residual std devs) for the initial window to be accepted
+  min_rmse: 0.03                         # floor on each feature's residual scale (index units)
+  max_harmonics: 3                       # 1-3, seasonal model complexity (grows with segment length automatically, capped here)
+  outlier_p: 0.999999                    # probability level above which an isolated init-window observation is dropped
+  max_segments: 16                       # cap on segments per pixel
+  min_magnitude: 0.1                     # keep a confirmed break only if the shift reaches this on one of magnitude_features (0 = off)
+  magnitude_features: [NBR, NDVI]
+  min_break_span_days: 45                # confirming run must also span this many days (0 = off)
+  refit_every: 3                         # refit the model every N accepted observations (1 = always)
+  aggregate_days: 15                     # bin observations per sensor into N-day medians before segmenting (0 = off; 30 = monthly)
+  season_window: [152, 258]              # only use observations in this day-of-year range (~1 Jun-15 Sep); [] = whole year
+  min_magnitude_same_class: 0.2          # stricter min_magnitude when the class does not change across the break
+  persist_days: 300                      # the shift must still show >= this many days after the break (0 = off)
+  min_obs_break_year: 8                  # usable observations required within a year of a break (0 = off)
+  block_rows: 50                         # row-block height of the temporary scene cube (memory per block scales with it)
+  # Scenes decoded concurrently while building the cube -- this is a thin
+  # thread pool around zarr reads (I/O/decompression-bound, not CPU-bound),
+  # so it scales usefully well past your core count. Measured on real pilot
+  # data (811 scenes, 24-core machine): 4 -> 20 threads cut the read pass
+  # from ~22s to ~17s. The much bigger cost (~80% of a tile's total time) is
+  # the per-pixel Numba segmentation pass below, which this does not touch.
+  io_threads: 20
+  numba_threads: 0                       # 0 = use every core for the per-pixel segmentation pass
 
 # ----------------------------------------------------------------------
-# BFAST-Monitor fire cross-check (pure Python reimplementation)
+# Per-pixel, per-water-year snow/ice/open-water summaries
+# Reads Stage 7's monthly class composites directly (the classifier's own
+# snow_cover/ice_cover/open_water class) -- a categorical signal, distinct
+# from change_detection's continuous vegetation-index trend model above,
+# which excludes these same classes for the opposite reason.
 # ----------------------------------------------------------------------
-bfast:
-  monitor_start: "2020-01-01"           # split point: before = stable history, on/after = monitored for a break
-  order: 3                              # harmonic regression order (trend + this many (cos,sin) pairs)
-  alpha: 0.05                           # CUSUM significance level
-  min_history_obs: 12
-  min_monitoring_obs: 3
-  n_workers: 1                          # CPU processes (never GPU)
-  output_root: outputs/bfast
+snow_water_dynamics:
+  output_root: outputs/snow_water_dynamics
+  tiles: []                              # empty = every tile in the registry
+  overwrite: false
+  water_year_start_month: 10             # 1-12; 10 = October (Water Survey of Canada's standard water-year start)
+  # Unlike change_detection, this stage does no internal multi-core work of
+  # its own -- tiles are fully independent, so this benefits from
+  # inter-tile parallelism the way mosaic.workers does. mosaic.workers=16
+  # froze the machine once (see mosaic's own comment above); this stage is
+  # far lighter per tile (no full-tile numpy array kept resident), so a
+  # higher value is more defensible here, but still watch memory the first
+  # time you raise it on a new machine.
+  workers: 16
 
 # ----------------------------------------------------------------------
 # NDVI regrowth trajectory / dNBR burn severity
-# No NDSI snow filter here by design -- the trained classifier's own
-# snow_cover class already answers that from the same composites.
+# No NDSI snow filter here by design -- snow/ice/water dynamics are tracked
+# separately by snow_water_dynamics above, from the same classifier output.
 # ----------------------------------------------------------------------
 regrowth_severity:
-  break_source: ccdc                    # ccdc | bfast -- which break-detection output supplies disturbance dates
   output_root: outputs/regrowth_severity
+  tiles: []                              # empty = every tile in the registry
+  overwrite: false
+  workers: 16                           # see snow_water_dynamics.workers's own comment above
+  month_threads: 4                      # monthly composites computed this many months ahead in threads inside a tile (1 = sequential)
+
+# ----------------------------------------------------------------------
+# Persistent land-cover object tracking (agriculture, cutblock, built-up,
+# burned/regrowth) -- appearance/end month per pixel, not just a per-month
+# state. burned_disturbed reuses change_detection's own break date as its
+# appearance month rather than being detected purely from the monthly
+# composite majority vote the other tracked classes use.
+# ----------------------------------------------------------------------
+landcover_persistence:
+  output_root: outputs/landcover_persistence
+  tiles: []                              # empty = every tile in the registry
+  overwrite: false
+  workers: 16                           # see snow_water_dynamics.workers's own comment above
+  tracked_classes: [burned_disturbed]   # only classifier states that persist; uses (cutblock, cropland, built) are named by event_typing
+  window_size: 5                        # observed months in the sliding majority-vote window
+  min_fraction: 0.8                      # >= this fraction of the last window_size OBSERVED months must show the class to start it
+  end_fraction: 0.2                      # ... and <= this fraction to end it (hysteresis)
+  masked_classes: [cloud, shadow, snow_cover, ice_cover]   # unobserved months: skipped by the vote
+  default_min_duration_months: 12        # drop intervals shorter than this
+  min_duration_months: {}                # per-class override, e.g. {burned_disturbed: 6}
+  require_break_classes: [burned_disturbed]  # need a Stage 09 break (NBR/NDVI fall) at the start
+  break_tolerance_months: 18
+  break_after_months: 6
+  min_break_drop: 0.1
 
 # ----------------------------------------------------------------------
 # Combined annual / month-to-month change maps
 # Three classification-change confidence bands, kept separate on purpose:
 # raw (noisy but immediate), persistent (confirmed over follow-up months),
-# corroborated (confirmed by a nearby CCDC/BFAST break).
+# corroborated (confirmed by a nearby segmentation break).
 # ----------------------------------------------------------------------
 change_maps:
   persistence_periods: 1                # follow-up months required to confirm a "persistent" change
-  corroboration_window_days: 45         # max days between a compared-period boundary and a CCDC/BFAST break to corroborate
+  corroboration_window_days: 45         # max days between a compared-period boundary and a segmentation break to corroborate
   output_root: outputs/change_maps
+  tiles: []                              # empty = every tile in the registry
+  overwrite: false
+  workers: 16                           # see snow_water_dynamics.workers's own comment above
+
+# ----------------------------------------------------------------------
+# Naming change events from the detected states (script 12): fire, cutblock
+# (duration + forest recovery), permanent clearing (road/pad/mine/built candidate),
+# canopy decline, cropland (annual bare/grass cycle). Uses are read from the behaviour of the
+# surface-state classes, they are not classes.
+# ----------------------------------------------------------------------
+event_typing:
+  output_root: outputs/change_events
+  tiles: []                             # empty = every tile in the registry
+  overwrite: false
+  forest_class: forest
+  grass_class: grassland_herbaceous
+  bare_class: bare_ground
+  burned_class: burned_disturbed
+  masked_classes: [cloud, shadow, snow_cover, ice_cover]   # unobserved months: skipped
+  min_drop: 0.15                        # NBR/NDVI fall that makes a break a loss
+  min_fraction: 0.8                     # >= this forest share of a season = forest (before / recovered)
+  end_fraction: 0.2                     # <= this forest share of a season = cleared
+  burn_min_fraction: 0.4                # burned share of the cleared seasons that makes it a fire
+  cutblock_season: [5, 10]              # months (May-October) the cutblock rule looks at
+  min_season_obs: 2                     # observed months a season needs to count
+  pre_seasons: 2                        # forest in this many observed seasons before the break
+  min_cleared_years: 3                  # not forest for this many seasons in a row (forest takes years to come back)
+  permanent_years: 8.0                  # cleared, never recovered, mostly bare for this long = permanent clearing
+  permanent_bare_fraction: 0.6
+  crop_season: [5, 10]                  # months (May-October) bare and grass must roll through
+  crop_min_months_per_year: 2           # observed months of EACH of bare and grass in that season = a cycling year
+  crop_min_run_years: 4                 # cycling EVERY observed year from its first year to the end of the series, for at least this many years = cropland
+  crop_allowed_gaps: 0                  # observed years allowed not to cycle (0 = strictly every year)
+  crop_max_forest_fraction: 0.0         # forest share allowed from the start year on (0 = never forest again)
+
+# ----------------------------------------------------------------------
+# Vegetation dynamics (script 14): what the vegetation does BETWEEN breaks.
+# One monthly index cube per tile (temporary, on disk), then per pixel:
+# phenology, slow trends, monthly anomalies, interannual variability.
+# Every element has its own `enabled`.
+# ----------------------------------------------------------------------
+vegetation_dynamics:
+  enabled: true
+  output_root: outputs/vegetation_dynamics
+  tiles: []                             # empty = every tile in the registry
+  overwrite: false
+  workers: 4                            # tiles in parallel; memory per worker = the yearly output arrays (a few hundred MB per 8 km tile)
+  month_threads: 4                      # months of the cube built ahead in threads inside a tile (1 = sequential)
+  block_rows: 64                        # rows per block of the per-pixel pass (smaller = less RAM)
+  indices: [NDVI]                       # one cube + one set of outputs per index (NBR also possible; costs disk and time)
+  growing_season: [5, 10]               # months (May-October) of the yearly mean / anomaly
+  min_gs_obs: 2                         # observed growing-season months a year needs for its yearly mean / max
+  min_year_obs: 5                       # observed months (whole year) a year needs for a phenology fit
+  mask_classes: [cloud, shadow, snow_cover, ice_cover, open_water]   # months whose class composite is one of these are dropped (an index under snow is not vegetation)
+  phenology:
+    enabled: true                       # peak month/value, amplitude, season start / end / length (day of year), per year
+    sos_fraction: 0.5                   # season start/end = curve crossing low + fraction * (peak - low)
+    baseline_percentile: 10.0           # `low` = this percentile of all the pixel's observations
+    min_amplitude: 0.08                 # peak - low below this = no seasonal cycle that year
+    max_gap_months: 2                   # refuse to interpolate across more unobserved months than this
+    trends: true                        # also a trend on the yearly season start / end / length (needs trend.enabled)
+  trend:
+    enabled: true                       # Theil-Sen slope + Mann-Kendall (S, p) of the yearly series: slow greening / browning
+    series: [growing_season_mean, annual_max]
+    min_years: 8
+    since_last_break: true              # also fitted on the years after each pixel's latest Stage 09 break
+  anomalies:
+    enabled: true                       # monthly z-score against the pixel's own climatology, reduced per year
+    robust: true                        # median / MAD instead of mean / std
+    baseline_years: null                # [first_year, last_year] the climatology is computed on; null = every year
+    min_clim_obs: 5
+    min_scale: 0.02                     # floor of the scale (avoids huge z on very stable pixels)
+    extreme_z: 2.0                      # |z| beyond this = extreme month
+    store_monthly: false                # also write the full monthly z cube (large: n_months x H x W float16)
+  variability:
+    enabled: true                       # coefficient of variation and mean year-to-year change of the yearly series
+    min_years: 5
+
+# ----------------------------------------------------------------------
+# Recovery analysis (script 14): how the land comes back after each named
+# event of script 12 (event_typing). Data tables, one row per event.
+# Needs the monthly cube of vegetation_dynamics (same run); DEM is optional.
+# ----------------------------------------------------------------------
+recovery_analysis:
+  enabled: true
+  output_root: outputs/recovery_analysis
+  overwrite: false
+  index: NDVI                           # must be in vegetation_dynamics.indices
+  event_types: [fire, cutblock, permanent_clearing, canopy_decline, other_loss]   # from event_typing (gain is left out)
+  curves:
+    enabled: true                       # yearly index after each event relative to the pre-event baseline; recovery time, trough, rate
+    max_years: 20                       # years after the break year kept in the curve
+    pre_years: 3                        # baseline = median of this many years before the break year
+    min_pre_years: 2
+    recovery_threshold: 0.8             # recovered = back to this share of the baseline...
+    sustain_years: 2                    # ... for this many observed years in a row
+  succession:
+    enabled: true                       # dominant class of each growing season after the event; Markov + class-share tables
+    max_years: 20
+    min_season_obs: 2
+    forest_class: forest
+  factors:
+    enabled: true                       # event table joined with terrain (DEM) + severity; binned summary (needs curves)
+    elevation_bins_m: [0, 500, 1000, 1500, 2000, 4000]
+    slope_bins_deg: [0, 5, 15, 30, 90]
+    aspect_sectors: 8
+    min_group_size: 5                   # smaller groups are left out of the binned summary

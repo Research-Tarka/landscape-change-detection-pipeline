@@ -2,19 +2,21 @@
 
 For each tile and month, every sensor's per-scene classification raster
 (see :mod:`.engine`) that falls in that month is reprojected onto the
-finest grid available that tile-month, then reduced to one composite per
-class rule.
+reference grid, then reduced to one composite per class rule.
 
-Resolution priority
---------------------
-``composites.sensor_resolution_priority`` (default ``s2 > l9 > l8 > l7 >
-l5``) picks each tile-month's composite grid: the first sensor in that list
-with any scene that tile-month sets the resolution every other sensor's
-class map is reprojected onto, nearest-neighbour (categorical labels, never
-continuous-value resampling). The achieved resolution is stored as an
-explicit per-composite attribute (``resolution_m``) rather than assumed
-uniform across the time series, since a tile can have Sentinel-2 coverage
-one month and only Landsat 5 the next.
+Reference grid
+---------------
+Every sensor is fetched onto the unified 10 m grid pinned to the DEM, so
+there is no per-sensor resolution left to pick between -- ``composites.sensor_resolution_priority``
+(default ``s2 > l9 > l8 > l7 > l5``) only picks *which* sensor's scene
+supplies the reference transform when more than one is present that
+tile-month (an arbitrary but deterministic tie-break, not a resolution
+choice), and every other sensor's class map is reprojected onto it,
+nearest-neighbour (categorical labels, never continuous-value resampling).
+The achieved resolution is read directly off the reference scene's own
+transform and stored as an explicit per-composite attribute
+(``resolution_m``), rather than assumed -- confirms the unified grid held
+rather than silently trusting it.
 
 Per-class reduction rule
 -------------------------
@@ -56,11 +58,6 @@ from typing import Optional
 import numpy as np
 
 from landscape_change_detection_pipeline.inference.engine import read_class_map, scene_output_paths
-
-#: Landsat/Sentinel-2 native resolution, metres per pixel, used only to
-#: report ``resolution_m`` on each composite (the actual grid comes from the
-#: winning sensor's own stored transform).
-SENSOR_RESOLUTION_M: dict[str, float] = {"s2": 10.0, "l9": 15.0, "l8": 15.0, "l7": 15.0, "l5": 30.0}
 
 
 @dataclass(frozen=True)
@@ -238,21 +235,37 @@ def _aligned_stack(scenes: list[SceneClassMap], sensor_priority: tuple[str, ...]
     return np.stack(aligned, axis=0), reference
 
 
-def _median_reduce(stack: np.ndarray, class_id: int, nodata: int) -> np.ndarray:
-    """Per-pixel majority vote for ``class_id``: true wherever more of the
-    valid (non-nodata) votes at that pixel are this class than any other."""
-    is_class = stack == class_id
+def _per_class_vote_counts(stack: np.ndarray, num_classes: int, nodata: int) -> np.ndarray:
+    """Per-pixel, per-class vote counts across the scene axis, in one pass.
+
+    Returns ``(num_classes, H, W)`` int32 counts. This one-hot-and-sum
+    (``stack[..., None] == arange(num_classes)``, summed over the scene
+    axis) replaces the previous per-class-in-a-Python-loop ``stack ==
+    class_id`` scan -- num_classes full ``(n_scenes, H, W)`` passes over the
+    same array -- with a single vectorized pass, since
+    ``_median_reduce_from_counts``/``_any_occurrence_reduce_from_counts``
+    below need nothing from the stack except each class's own count per
+    pixel. Nodata votes count toward no class (excluded via ``valid``
+    below), matching the previous per-class scan's own semantics.
+    """
     valid = stack != nodata
-    votes_for = is_class.sum(axis=0)
-    votes_valid = valid.sum(axis=0)
-    # Majority within the valid votes -- strictly more than half, so a class
-    # tied with another does not spuriously win under "median".
+    class_ids = np.arange(num_classes, dtype=stack.dtype).reshape(num_classes, 1, 1, 1)
+    one_hot = (stack[np.newaxis, ...] == class_ids) & valid[np.newaxis, ...]
+    return one_hot.sum(axis=1, dtype=np.int32)
+
+
+def _median_reduce_from_counts(counts: np.ndarray, class_id: int, votes_valid: np.ndarray) -> np.ndarray:
+    """Per-pixel majority vote for ``class_id`` from precomputed vote counts:
+    true wherever more of the valid (non-nodata) votes at that pixel are this
+    class than any other (strictly more than half, so a tie never wins)."""
+    votes_for = counts[class_id]
     return (votes_valid > 0) & (votes_for * 2 > votes_valid)
 
 
-def _any_occurrence_reduce(stack: np.ndarray, class_id: int) -> np.ndarray:
-    """True wherever ``class_id`` appears in even one scene of the stack."""
-    return (stack == class_id).any(axis=0)
+def _any_occurrence_reduce_from_counts(counts: np.ndarray, class_id: int) -> np.ndarray:
+    """True wherever ``class_id`` appears in even one scene of the stack,
+    from precomputed vote counts."""
+    return counts[class_id] > 0
 
 
 def build_monthly_composite(
@@ -276,6 +289,9 @@ def build_monthly_composite(
     stack, reference = _aligned_stack(scenes, sensor_priority)
     height, width = stack.shape[1:]
 
+    counts = _per_class_vote_counts(stack, num_classes, nodata)
+    votes_valid = counts.sum(axis=0)
+
     any_occurrence_hits: list[tuple[int, int, np.ndarray]] = []  # (priority, class_id, mask)
     fallback_occurrence_hits: list[tuple[int, int, np.ndarray]] = []  # (priority, class_id, mask)
     # -1 is a sentinel distinct from `nodata` (which can be any uint8 value,
@@ -288,15 +304,15 @@ def build_monthly_composite(
     for class_id in range(num_classes):
         rule, priority = class_rules.get(class_id, (default_rule, 0))
         if rule == "any_occurrence":
-            mask = _any_occurrence_reduce(stack, class_id)
+            mask = _any_occurrence_reduce_from_counts(counts, class_id)
             if mask.any():
                 any_occurrence_hits.append((priority, class_id, mask))
         elif rule == "fallback_occurrence":
-            mask = _any_occurrence_reduce(stack, class_id)
+            mask = _any_occurrence_reduce_from_counts(counts, class_id)
             if mask.any():
                 fallback_occurrence_hits.append((priority, class_id, mask))
         else:
-            mask = _median_reduce(stack, class_id, nodata)
+            mask = _median_reduce_from_counts(counts, class_id, votes_valid)
             median_winner = np.where(mask, class_id, median_winner)
 
     composite = np.where(median_winner >= 0, median_winner, nodata).astype(np.uint8)
@@ -317,7 +333,13 @@ def build_monthly_composite(
         composite = np.where(mask, class_id, composite).astype(np.uint8)
 
     sensors_present = sorted({s.sensor for s in scenes})
-    resolution_m = min(SENSOR_RESOLUTION_M.get(s, float("nan")) for s in sensors_present)
+    # Every sensor is fetched onto the unified 10 m grid pinned to the DEM --
+    # there is no per-sensor resolution left to pick between, so the achieved resolution is read
+    # directly off the reference scene's own transform (its actual pixel
+    # size) rather than a per-sensor native-resolution table, which would
+    # report each sensor's pre-unified-grid resolution (e.g. 15/30 m for
+    # Landsat) even though every scene has already been resampled to 10 m.
+    resolution_m = abs(reference.transform[0])
 
     return {
         "composite": composite,
@@ -375,20 +397,36 @@ def build_all_monthly_composites(
     class_rules: dict[int, tuple[str, int]],
     nodata: int = 255,
     overwrite: bool = False,
+    progress_callback=None,
 ) -> list[Path]:
     """Build every tile-month composite available for one tile. Returns the
-    paths actually (re)written."""
+    paths actually (re)written.
+
+    ``progress_callback(tile_id, month, month_index, total_months, written)``,
+    if given, is called once per month *processed* (written or skipped as
+    already built) -- a long tile (hundreds of months) otherwise gives no
+    signal at all until the whole tile is done, which is unusable for
+    tracking a real run's progress. Must be picklable if this runs inside a
+    ``ProcessPoolExecutor`` worker (a plain function or a
+    ``functools.partial`` of one, never a closure/lambda over local state).
+    """
     scenes = discover_scene_class_maps(inference_root, tile_id)
     groups = group_by_tile_month(scenes)
+    months = sorted(groups)
 
     written: list[Path] = []
-    for month in sorted(groups):
+    for month_index, month in enumerate(months, start=1):
         out_path = composite_output_path(output_root, tile_id, month)
+        wrote_this_month = False
         if out_path.is_file() and not overwrite:
-            continue
-        result = build_monthly_composite(
-            groups[month], num_classes, sensor_priority, default_rule, class_rules, nodata
-        )
-        write_composite(out_path, result)
-        written.append(out_path)
+            pass
+        else:
+            result = build_monthly_composite(
+                groups[month], num_classes, sensor_priority, default_rule, class_rules, nodata
+            )
+            write_composite(out_path, result)
+            written.append(out_path)
+            wrote_this_month = True
+        if progress_callback is not None:
+            progress_callback(tile_id, month, month_index, len(months), wrote_this_month)
     return written

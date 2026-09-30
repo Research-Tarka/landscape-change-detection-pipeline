@@ -58,6 +58,8 @@ def main(argv: list[str] | None = None) -> int:
         class_config=class_config,
         index_names=index_names,
         dem_layer_names=dem_layer_names,
+        include_doy_features=config.features.include_doy_features,
+        include_latlon_features=config.features.include_latlon_features,
     )
     print(f"[training-cache] wrote {len(written)} scene caches to {config.features.train_root}")
     print(f"[training-cache] {len(annotated) - len(written)} scenes already up to date, skipped")

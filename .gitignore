@@ -47,3 +47,9 @@ _work_test/
 .claude/
 
 .pytest_cache/
+
+configs/config_catboost.yaml
+configs/config_threshold.yaml
+configs/config_unet.yaml
+logs
+outputs_export/

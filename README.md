@@ -35,15 +35,16 @@ python scripts/02_download_dem.py
 python scripts/03_download_scenes.py --split all --parallel
 python scripts/04_export_training_cache.py
 python scripts/05_train_model.py
+python scripts/05b_generate_pseudo_labels.py   # optional, only if training.pseudo_label.enabled
 python scripts/06_run_inference.py
 python scripts/07_build_monthly_composites.py
 python scripts/08_build_mosaics.py
-python scripts/09_build_index_composites.py
-python scripts/10_build_index_mosaics.py
-python scripts/11_run_ccdc.py
-python scripts/12_run_bfast.py
-python scripts/13_build_regrowth_severity.py
-python scripts/14_build_change_maps.py
+python scripts/09_run_change_detection.py
+python scripts/10_build_snow_water_dynamics.py
+python scripts/11_build_regrowth_severity.py
+python scripts/12_build_landcover_persistence.py
+python scripts/13_build_change_maps.py
+python scripts/14_build_vegetation_dynamics.py   # phenology / trends / anomalies + event recovery / succession
 
 python scripts/export_gui.py   # on demand, never automatic, run any time
 ```
@@ -106,6 +107,25 @@ The model and its training hyperparameters (epochs, patience, patch size, etc.) 
 - `deeplabv3plus` -- DeepLabv3+ (`model.deeplabv3plus`), with a configurable ResNet-family backbone, optionally ImageNet-pretrained.
 - `segformer` -- SegFormer (`model.segformer`), with a configurable MiT encoder variant (`mit-b0` through `mit-b5`), optionally pretrained.
 
+For the torch model types, three optional mechanisms in `training` target interclass confusion and low label diversity without touching the pixel-level class-rebalancing knob (`training.class_weighting`), which can destabilize training if pushed too hard on a very skewed corpus:
+
+- **Radiometric augmentation** (`training.radiometric_augmentation`) -- per-patch brightness/contrast jitter plus Gaussian noise, applied only to the spectral-index channels (never DEM/day-of-year/lat-lon, which have no radiometric meaning). Stacks on top of the existing geometric augmentation (`augment_flips`/`augment_rotate90`).
+- **Scene oversampling** (`training.scene_oversampling`) -- draws a training scene more often in proportion to its share of rare-class pixels (`rare_class_threshold`/`boost_factor`), without changing per-pixel loss weight or the natural class mix inside a drawn patch. Gentler than `class_weighting`; a good first thing to try if that one has hurt training.
+- **Confusion penalties** (`training.confusion_penalties`) -- directional extra loss terms for specific (true class, predicted class) pairs observed in a confusion matrix, e.g. `[{true_class: 6, predicted_class: 7, beta: 1.0}]`. Targets a specific confusion directly, rather than rebalancing every class.
+- **Pseudo-labeling / self-training** (`training.pseudo_label`) -- see step 05b below, for the case of low label diversity rather than class imbalance.
+
+### 05b -- Pseudo-label generation (`05b_generate_pseudo_labels.py`, optional)
+
+Only relevant when `training.pseudo_label.enabled: true`. Scores every scene under `data/tiles` that has **no** MaskForge annotation, using an already-trained checkpoint from step 05, and keeps only the pixels the model is confident about (`confidence_threshold`) as pseudo-labels -- a way to expose the model to more scene diversity than the small annotated corpus alone provides, without hand-labeling more data.
+
+`data/tiles` is typically far larger than what fits in RAM (every downloaded scene for every tile, not just annotated ones), so this step never loads more than one scene at a time: build its feature stack, run sliding-window inference, threshold, write straight to disk, free the memory, move to the next scene. The result is written to `training.pseudo_label.pseudo_label_root` in the exact same per-scene `.npz` cache schema step 04 uses for real annotations, so it needs no special handling downstream.
+
+Workflow: train once normally (step 05) -> run this script against that checkpoint -> re-run step 05 with `training.pseudo_label.enabled: true`, which then mixes the pseudo-labeled scenes into training as a second, reduced-weight `PatchDataset` (`pseudo_label_weight` controls how often a pseudo-labeled scene is drawn relative to a real one; `pseudo_label_loss_weight` scales its contribution to the loss, so a wrong pseudo-label costs less than a wrong real annotation).
+
+```
+python scripts/05b_generate_pseudo_labels.py --config configs/config.yaml --checkpoint models/checkpoints/unet_best.pt
+```
+
 ### 06 -- Inference (`06_run_inference.py`)
 
 Runs the trained checkpoint (by default the one written at step 05) over **every** scene stored in the zarr stores -- not just annotated ones. Sliding window with Hann-window weighting to avoid edge artifacts between patches. Result: one class map per scene, written to `outputs/inference/<tile_id>/<sensor>/<scene_id>/class_map.npz`. Idempotent -- an already-processed scene is skipped unless `--overwrite`.
@@ -120,44 +140,56 @@ Assembles per-tile monthly composites (step 7, still fragmented and in `.npz`) i
 
 Since neighboring tiles can have different resolutions in the same month (one with S2 10 m, its neighbor only Landsat 15 m), output resolution is chosen per month at the AOI scale: the finest resolution achieved anywhere that month, with nearest-neighbor resampling of coarser tiles up to that grid. Result: `outputs/mosaics/<year>-<month>/mosaic.npz`, one continuous raster per month across the whole AOI. Like every intermediate step in this pipeline, this is `.npz`, not a GeoTIFF -- use `export_gui.py` on demand to get a GIS-readable file for a specific period.
 
-### 09 -- Monthly spectral index composites (`09_build_index_composites.py`)
+### 09 -- Per-pixel temporal segmentation (`09_run_change_detection.py`)
 
-The continuous-reflectance counterpart to step 7 (which only keeps classes): for each tile and month, computes NDVI/NDSI/NBR/NDWI/Tasseled-Cap/etc. per scene (never used by the classification model, only for change analysis), excludes cloud/shadow pixels via each scene's own classification, then reduces each index into median/min/max/observation-count per tile-month. Result: `outputs/index_composites/<tile_id>/<year>-<month>/indices.npz`.
+Per-pixel breakpoint detection (break date + per-feature magnitude/level/trend/seasonal amplitude), run **entirely locally** on this pipeline's own already-resampled-onto-the-DEM's-grid stored data -- never against raw GEE collections (which would produce breaks on different pixels than the ones the model sees). See `landscape_change_detection_pipeline/change/segmentation.py` for the method and `change_detection.py` for the two-pass tile driver (scene-major cube pass, then pixel-major block pass, so every scene is decoded exactly once).
 
-**Not used by CCDC or BFAST** (steps 11/12), which fit directly on raw per-scene reflectance bands instead -- see the note under step 11. These monthly index composites (and their AOI-wide mosaics from step 10) are consumed only by step 13 (dNBR severity and NDVI regrowth trajectory).
+Fit on the configured spectral indices (`change_detection.features`, default NBR/NDVI/NDWI_GAO/TC_BRIGHTNESS) built from each scene's own reflectance -- the same per-pixel, multi-decade time series, at real per-scene temporal resolution (never a pre-aggregated monthly value, which would throw away the resolution breakpoint detection depends on). An observation is excluded from a pixel's series if that scene's own classification puts it in `change_detection.masked_classes` (cloud/shadow/snow/ice/water by default). Result: `outputs/change_detection/<tile_id>/segments.npz`, one row per detected segment across every pixel.
 
-### 10 -- AOI-wide index mosaics (`10_build_index_mosaics.py`)
+### 10 -- Snow/ice/open-water dynamics (`10_build_snow_water_dynamics.py`)
 
-Step 8's counterpart for continuous indices instead of classes -- same crop-and-place geometry. Result: `outputs/index_mosaics/<year>-<month>/indices.npz`.
+Per-pixel, per-water-year summary of Stage 7's monthly class composites: how many observed months were snow-covered/ice-covered/open-water, and the water-year-relative month index of first/last observed snow. A categorical signal read directly from the trained classifier's own classes -- deliberately kept separate from Stage 09's continuous vegetation-index trend model, which excludes these same classes since mixing seasonal snow/ice/water into a spectral-index harmonic fit would read every seasonal cycle as a spurious break. Result: `outputs/snow_water_dynamics/<tile_id>/snow_water_dynamics.npz`.
 
-### 11 -- Local CCDC/COLD (`11_run_ccdc.py`)
+### 11 -- NDVI regrowth and dNBR severity (`11_build_regrowth_severity.py`)
 
-Per-pixel breakpoint detection (date + per-band magnitude) via `pyxccd` (COLD), run **entirely locally** on this pipeline's own already-resampled-onto-the-DEM's-grid stored data -- never against raw GEE collections (which would produce breaks on different pixels than the ones the model sees). The cloud/shadow/snow/water mask comes from this pipeline's own classification, not a GEE cloud percentage. LandTrendr was evaluated and dropped (no local alternative exists).
+For every pixel with a detected break (Stage 09): dNBR between the monthly NBR composite just before and just after the break (continuous burn severity, complementary to the model's categorical `burned_disturbed` class), and month-by-month NDVI trajectory since the break (vegetation regrowth -- no model class can give this, it is a trajectory over time, not a point-in-time state). Every month's NBR/NDVI composite needed is computed on demand directly from stored scenes, never from a separate persisted index-composite store. Result: `outputs/regrowth_severity/<tile_id>/regrowth_severity.npz`.
 
-CCDC is fit on the six normalized reflectance bands every sensor is aligned to (blue/green/red/nir/swir1/swir2) -- the same per-pixel, multi-decade time series built once per tile on a single shared grid (the finest resolution any sensor ever achieved for that tile). This is **per-scene**, not the monthly index composites from step 9/10: COLD needs one observation per actual scene date to fit its time-series model, so feeding it a pre-aggregated monthly value would throw away the temporal resolution breakpoint detection depends on.
+### 12 -- Persistent land-cover object tracking (`12_build_landcover_persistence.py`)
 
-### 12 -- BFAST-Monitor (`12_run_bfast.py`)
+Several classes in `configs/classes.yaml` (`cultivated_agriculture`, `cutblock_harvest`, `built_up_infrastructure`, `burned_disturbed`) are conceptually persistent objects, not instantaneous per-scene states -- a field or a cutblock has an appearance month and, sometimes, an end month (abandonment, regrowth back to forest). This stage walks Stage 7's monthly class composites per pixel and turns each tracked class from a per-month state into dated intervals, using a sliding-window majority vote over *observed* months (`landcover_persistence.window_size`/`min_fraction`) so a single misclassified month cannot register as a fake appearance or disappearance. `burned_disturbed` is a special case: its appearance date is read directly from Stage 09's own detected break (a real spectral break, a strictly better signal than a monthly-class majority vote), and only its recovery/end date comes from the generic smoothed-majority detector -- see `landscape_change_detection_pipeline/change/landcover_persistence.py` for the full design. Falls back to the generic monthly-composite detector for `burned_disturbed` too if Stage 09 has not been run for a tile. Result: `outputs/landcover_persistence/<tile_id>/landcover_persistence.npz`, one row per (pixel, class, interval) -- grouping into connected-component polygons (one cutblock = one object with one age) is left to a downstream GIS step, not done here.
 
-A fire-specific cross-check (BFAST is ~96% accurate for fire vs. ~73% for CCDC/LandTrendr-family methods per the 2025 comparison cited in the initial design), hand-reimplemented in pure Python (the `bfast` pip package has been dead since 2021, R was explicitly ruled out to stay on a single stack). Harmonic regression over a stable history period + a closed-boundary CUSUM statistical test on the monitored period's residuals.
+### 13 -- Combined change maps (`13_build_change_maps.py`)
 
-Unlike CCDC (fit directly on the six raw bands), BFAST is applied to a single derived index: NBR (normalized burn ratio), computed from that same aligned band stack -- the standard fire-sensitive index, and what the univariate `bfastmonitor` formulation this module reimplements expects.
+Combines classification + Stage 09's segmentation + dNBR into a final output per pair of periods (annual: same month, consecutive years; month-to-month: consecutive stored months). Three classification-change confidence bands, kept deliberately separate (never merged): `raw` (noisy immediate comparison), `persistent` (confirmed by the following month), `corroborated` (confirmed by a nearby segmentation break). Cloud/shadow pixels in either compared period are excluded, never counted as change.
 
-### 13 -- NDVI regrowth and dNBR severity (`13_build_regrowth_severity.py`)
+### 14 -- Vegetation dynamics and event recovery (`14_build_vegetation_dynamics.py`)
 
-For every pixel with a detected break (CCDC or BFAST): dNBR between the composite just before and just after the break (continuous burn severity, complementary to the model's categorical `burned_bare_disturbed` class), and month-by-month NDVI trajectory since the break (vegetation regrowth -- no model class can give this, it is a trajectory over time, not a point-in-time state).
+New *data* (not maps) built from one monthly NDVI cube per tile (temporary, on disk, deleted at the end; snow/ice/water months dropped). Every element has its own `enabled` switch in `config.vegetation_dynamics` / `config.recovery_analysis`.
 
-### 14 -- Combined change maps (`14_build_change_maps.py`)
+`vegetation_dynamics` -- what the vegetation does *between* breaks, per pixel:
+- **phenology**: per year, peak month/value, amplitude, start / end / length of the growing season (day of year, interpolated between observed months);
+- **trend**: Theil-Sen slope + Mann-Kendall (S, p) of the yearly growing-season mean and maximum (slow greening / browning), also fitted only on the years after each pixel's latest break, and on the phenology series (is the season getting longer);
+- **anomalies**: monthly z-score against the pixel's own climatology (robust median/MAD by default), reduced per year (growing-season z, worst month, number of extreme months) plus the worst anomaly ever seen;
+- **variability**: coefficient of variation and mean year-to-year change of the yearly series.
+Result: `outputs/vegetation_dynamics/<tile_id>/vegetation_dynamics.npz` (+ `monthly_anomaly_<index>.npz` when `anomalies.store_monthly`).
 
-Combines classification + CCDC/BFAST + dNBR into a final output per pair of periods (annual: same month, consecutive years; month-to-month: consecutive stored months). Three classification-change confidence bands, kept deliberately separate (never merged): `raw` (noisy immediate comparison), `persistent` (confirmed by the following month), `corroborated` (confirmed by a nearby CCDC/BFAST break). Cloud/shadow pixels in either compared period are excluded, never counted as change.
+`recovery_analysis` -- how the land comes back after each named event of Stage 12 (needs `event_typing` output; DEM optional). One row per event:
+- **curves**: yearly index after the event relative to its pre-event baseline, trough, recovery time (back to `recovery_threshold` of the baseline for `sustain_years` in a row -- right-censoring is explicit, never a fake "did not recover"), recovery rate;
+- **succession**: dominant class of each growing season after the event, years spent per class, state changes, year forest is dominant again; pooled per event type as a Markov transition table and class-share-by-years-since-event table;
+- **factors**: the event table joined with terrain (elevation, slope, northness/eastness, aspect sector), severity and pre-event level, plus a binned summary (event type x elevation / slope / aspect) with the share recovered by 5 and 10 years computed among events observable that long.
+Result: `outputs/recovery_analysis/<tile_id>/recovery_analysis.npz`. Definitions in `change/vegetation_dynamics.py` and `change/recovery_analysis.py`.
 
 ### On-demand export (`export_gui.py`)
 
 Converts any of this pipeline's stored outputs into GeoTIFF or CSV. The only place in the pipeline that pays the GeoTIFF write cost -- never called automatically by another step, and not numbered since it is not part of the sequential run: it can be run at any point once the file it targets exists.
 
-A GUI, not a CLI: `python scripts/export_gui.py` (it relaunches itself under `streamlit run` automatically). Point it at an `outputs/...` (or `data/tiles/...`, for DEM) folder, pick a file from the list, preview it, then export. Still on demand and one file at a time -- it never scans and exports in bulk.
+A GUI, not a CLI: `python scripts/export_gui.py` (it relaunches itself under `streamlit run` automatically). Point it at an `outputs/...` (or `data/tiles/...`, for DEM) folder, pick a file from the list, preview it, then export -- or use **Export everything** to write every raster (GeoTIFF) and every table (CSV) found under the folder in one go (same relative layout in a chosen output folder, optional name filter, skip-existing). Still on demand: nothing exports unless you press the button.
 
-- **Dense rasters** (class map, composite, mosaic, index composite/mosaic, change map, dNBR, bfast, per-tile DEM elevation/slope/aspect) -> GeoTIFF (COG), previewed as a quicklook + shape/dtype/min-max per band before export. Logic in `landscape_change_detection_pipeline.export.geotiff`.
-- **Sparse tables** that are not grids -- CCDC's per-pixel segment table (0..N segments per pixel) and the NDVI regrowth trajectory (0..N (pixel, month) rows per pixel) -- offer a choice: export the full table as CSV (`landscape_change_detection_pipeline.export.csv_export`), or a derived per-pixel *summary* GeoTIFF (for CCDC: latest break date, segment count, latest change probability/observation count -- the full segment table itself is not a grid and is lost in that derivation).
+Everything the pipeline generates is exportable:
+- **Dense rasters** (class map, composite, mosaic, change map, dNBR, snow/water dynamics, change events, segment maps, vegetation dynamics, recovery analysis, monthly anomalies, per-tile DEM) -> GeoTIFF (COG), previewed as a quicklook + shape/dtype/min-max per band before export. Year-stacked outputs become one band per year (`<name>__<year>`); a file mixing dtypes is written as one GeoTIFF per dtype. Logic in `landscape_change_detection_pipeline.export.geotiff`.
+- **Tables** -- the segment table, change events (+ cropland pixels), land-cover persistence intervals, the NDVI regrowth trajectory, recovery events, Markov / class-share / factor-summary tables -- -> CSV (`landscape_change_detection_pipeline.export.csv_export`), streamed in chunks; a file holding several tables lets you pick one. Land-cover persistence also has a dense GeoTIFF summary per tracked class. The bulk export is `landscape_change_detection_pipeline.export.batch`.
+
+The GUI lists files lazily (`export/browse.py`: `.npz` array headers are read without loading the data, previews are decimated to screen size), so pointing it at a large `outputs/` tree never loads the whole tree into RAM. Stage 12 also names each change event (cutblock, field, built surface, ...) from the monthly class series in `change/event_typing.py`; those event tables feed Stage 14's recovery analysis.
 
 ## Config: `config.yaml` vs `config.example.yaml`
 

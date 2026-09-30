@@ -338,20 +338,38 @@ class FeaturesConfig(BaseModel):
     GeoTIFFs (``features.tif`` + ``labels.tif`` per scene) reconstructed from
     ``train_root`` -- a folder you can hand to someone else (or open in QGIS
     yourself) without them needing anything from this pipeline.
+
+    ``include_doy_features``/``include_latlon_features`` add cyclical
+    day-of-year (``doy_sin``/``doy_cos``) and normalized scene-centroid
+    latitude/longitude (``lat_norm``/``lon_norm``) channels to the feature
+    stack (see
+    :func:`landscape_change_detection_pipeline.features.training_cache.build_feature_stack`).
+    Both default to ``True``: land-cover classes look spectrally different
+    by season (e.g. bare ground vs. snow-covered ground) and by region, and
+    giving the model that context directly as input channels lets one
+    taxonomy (``configs/classes.yaml``) and one model stay season/region-
+    agnostic instead of needing separate seasonal classes or separate
+    regional models. Changing either flag changes the model's input channel
+    count -- re-export the training cache (``scripts/04_export_training_cache.py``)
+    and retrain (``scripts/05_train_model.py``) after changing it.
     """
 
     train_root: str = "data/train_cache"
     mask_root: str = "data/masks"
     geotiff_export_root: str = "data/train_geotiff"
+    #: Parallel processes used by scripts/convert_cache_to_memmap.py (one scene in RAM each).
+    convert_workers: int = 4
     index_names: Optional[list[str]] = None
     dem_layer_names: Optional[list[str]] = None
+    include_doy_features: bool = True
+    include_latlon_features: bool = True
 
     @field_validator("index_names")
     @classmethod
     def _validate_index_names(cls, value: Optional[list[str]]) -> Optional[list[str]]:
         if value is None:
             return None
-        from landscape_change_detection_pipeline.features.spectral_indices import INDEX_NAMES
+        from landscape_change_detection_pipeline.features.spectral_indices import MODEL_INDEX_NAMES as INDEX_NAMES
 
         unknown = [name for name in value if name not in INDEX_NAMES]
         if unknown:
@@ -380,12 +398,47 @@ class FeaturesConfig(BaseModel):
 def resolved_feature_names(features: FeaturesConfig) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """``(index_names, dem_layer_names)`` a run should actually use: the
     config's own lists if set, else every available name (see
-    ``FeaturesConfig.index_names``/``dem_layer_names``)."""
+    ``FeaturesConfig.index_names``/``dem_layer_names``).
+
+    Does **not** include the DOY/lat-lon channel names -- those are
+    conditionally appended by
+    :func:`~landscape_change_detection_pipeline.features.training_cache.build_feature_stack`
+    itself based on ``features.include_doy_features``/``include_latlon_features``.
+    Use :func:`resolved_extra_feature_names` for those, or
+    :func:`all_resolved_feature_names` for the full, model-input-channel-count
+    list in the exact order ``build_feature_stack`` assembles them.
+    """
     from landscape_change_detection_pipeline.features.spectral_indices import DEM_LAYER_NAMES, INDEX_NAMES
 
     index_names = tuple(features.index_names) if features.index_names is not None else INDEX_NAMES
     dem_layer_names = tuple(features.dem_layer_names) if features.dem_layer_names is not None else DEM_LAYER_NAMES
     return index_names, dem_layer_names
+
+
+def resolved_extra_feature_names(features: FeaturesConfig) -> tuple[str, ...]:
+    """DOY/lat-lon channel names actually enabled by ``features``, in the
+    same order :func:`~landscape_change_detection_pipeline.features.training_cache.build_feature_stack`
+    appends them (DOY first, then lat/lon)."""
+    from landscape_change_detection_pipeline.features.spectral_indices import (
+        DOY_FEATURE_NAMES,
+        LATLON_FEATURE_NAMES,
+    )
+
+    names: tuple[str, ...] = ()
+    if features.include_doy_features:
+        names += DOY_FEATURE_NAMES
+    if features.include_latlon_features:
+        names += LATLON_FEATURE_NAMES
+    return names
+
+
+def all_resolved_feature_names(features: FeaturesConfig) -> tuple[str, ...]:
+    """Every feature channel name a run's feature stack will actually have,
+    in ``build_feature_stack``'s own order: spectral indices, DEM layers,
+    then (if enabled) DOY, then lat/lon. This is the list whose length is
+    the model's real input channel count."""
+    index_names, dem_layer_names = resolved_feature_names(features)
+    return (*index_names, *dem_layer_names, *resolved_extra_feature_names(features))
 
 
 class SplitConfig(BaseModel):
@@ -506,6 +559,51 @@ class CatBoostConfig(BaseModel):
     random_state: int = 0
     early_stopping_rounds: int = 50
 
+    #: Inverse-frequency class weights (see
+    #: :func:`landscape_change_detection_pipeline.training.losses.compute_class_weights`,
+    #: the same formula ``random_forest``'s ``class_weight="balanced"`` and
+    #: the torch models' weighted cross-entropy already use), passed as
+    #: CatBoost's own ``class_weights=`` at fit time -- without it, the
+    #: model has no reason to spend capacity on rare classes, which show up
+    #: as the near-zero IoU per-class entries. Default ``True`` since a
+    #: land-cover class distribution this skewed makes an unweighted fit
+    #: the wrong default, not a deliberate choice.
+    class_weighting: bool = True
+
+    #: Optuna search over (learning_rate, depth, l2_leaf_reg) -- see
+    #: :func:`landscape_change_detection_pipeline.models.catboost_model.search_catboost`.
+    #: ``n_trials<=0`` skips the search and fits once at this section's own
+    #: fixed hyperparameters above (mirrors ``ThresholdConfig``/``HpoConfig``).
+    n_trials: int = 0
+    sampler: str = "tpe"
+    #: ``"hyperband"`` prunes a trial early from its intermediate validation
+    #: score reported every ``metric_period`` boosting rounds (see
+    #: :func:`landscape_change_detection_pipeline.models.catboost_model.search_catboost`),
+    #: using ``search_iterations`` as Hyperband's resource axis. Mirrors
+    #: ``HpoConfig.pruner``. Ignored (with a logged warning) when
+    #: ``task_type="GPU"`` -- CatBoost supports neither pruning callbacks nor
+    #: resumable fitting on GPU, so every trial always runs to completion.
+    pruner: str = "none"
+    timeout_s: Optional[int] = None
+    study_storage: Optional[str] = None
+
+    #: Iteration budget used only during the Optuna search itself -- kept
+    #: low (versus the final refit's ``iterations``) so exploring many
+    #: candidate (learning_rate, depth, l2_leaf_reg) combinations stays
+    #: cheap; the winning trial is then refit once at ``iterations`` (the
+    #: real, full budget) before being returned. Separate from
+    #: ``iterations`` so "try lots of cheap trials, then one real training
+    #: run on the best params" is one knob apart, not one shared value.
+    search_iterations: int = 500
+    search_early_stopping_rounds: int = 30
+
+    @field_validator("pruner")
+    @classmethod
+    def _validate_pruner(cls, value: str) -> str:
+        if value not in ("none", "median", "hyperband"):
+            raise ValueError(f"catboost.pruner must be 'none', 'median', or 'hyperband', got {value!r}")
+        return value
+
 
 class LightGBMConfig(BaseModel):
     """Hyperparameters for the LightGBM classifier (see
@@ -540,6 +638,47 @@ class LightGBMConfig(BaseModel):
     device: str = "cpu"
     random_state: int = 0
     early_stopping_rounds: int = 50
+
+    #: Inverse-frequency class weights (see
+    #: :func:`landscape_change_detection_pipeline.training.losses.compute_class_weights`,
+    #: the same formula ``random_forest``'s ``class_weight="balanced"`` and
+    #: the torch models' weighted cross-entropy already use), applied as a
+    #: per-pixel sample weight at fit time -- LightGBM's native API has no
+    #: CatBoost-style ``class_weights=`` shortcut, so each row's weight is
+    #: its label's class weight. Default ``True``, matching every other
+    #: model type in this project: an unweighted fit on this skewed a
+    #: class distribution is the wrong default, not a deliberate choice.
+    class_weighting: bool = True
+
+    #: Optuna search over (learning_rate, num_leaves, min_data_in_leaf) --
+    #: see :func:`landscape_change_detection_pipeline.models.lightgbm_model.search_lightgbm`.
+    #: ``n_trials<=0`` skips the search and fits once at this section's own
+    #: fixed hyperparameters above (mirrors ``ThresholdConfig``/``HpoConfig``).
+    n_trials: int = 0
+    sampler: str = "tpe"
+    #: ``"hyperband"`` prunes a trial early from its intermediate validation
+    #: score reported every boosting round (see
+    #: :func:`landscape_change_detection_pipeline.models.lightgbm_model.search_lightgbm`),
+    #: using ``search_n_estimators`` as Hyperband's resource axis. Mirrors
+    #: ``HpoConfig.pruner``.
+    pruner: str = "none"
+    timeout_s: Optional[int] = None
+    study_storage: Optional[str] = None
+
+    #: Estimator budget used only during the Optuna search itself -- kept
+    #: low (versus the final refit's ``n_estimators``) so exploring many
+    #: candidate (learning_rate, num_leaves, min_data_in_leaf) combinations
+    #: stays cheap; the winning trial is then refit once at ``n_estimators``
+    #: (the real, full budget) before being returned.
+    search_n_estimators: int = 500
+    search_early_stopping_rounds: int = 30
+
+    @field_validator("pruner")
+    @classmethod
+    def _validate_pruner(cls, value: str) -> str:
+        if value not in ("none", "median", "hyperband"):
+            raise ValueError(f"lightgbm.pruner must be 'none', 'median', or 'hyperband', got {value!r}")
+        return value
 
 
 class UnetConfig(BaseModel):
@@ -646,6 +785,120 @@ class ConfusionPenaltyConfig(BaseModel):
     beta: float = 1.0
 
 
+class RadiometricAugmentationConfig(BaseModel):
+    """Radiometric jitter applied to the spectral-index channels of a
+    training patch, alongside the existing geometric augmentation (see
+    :class:`landscape_change_detection_pipeline.training.train.PatchDataset`).
+
+    Only the leading ``len(features.index_names)`` channels of the feature
+    stack (spectral indices / chromaticity ratios -- see
+    ``features/spectral_indices.py::INDEX_NAMES``) are perturbed; DEM,
+    day-of-year, and lat/lon channels are left untouched since brightness/
+    contrast/noise have no physical meaning for elevation, slope, aspect, or
+    the acquisition-date/location encodings. Applied only to the training
+    split -- never validation/test.
+
+    ``brightness_std``/``contrast_std`` are the standard deviation of a
+    per-patch multiplicative jitter (``contrast``) and additive jitter
+    (``brightness``) sampled once per patch and applied uniformly across its
+    spectral channels: ``x' = (x - mean) * (1 + contrast) + mean +
+    brightness``, using each channel's own train-corpus mean so contrast
+    scales around the channel's real center rather than zero.
+    ``noise_std`` is the standard deviation of i.i.d. Gaussian noise added
+    per pixel per channel, in the same normalized (post train-mean/std)
+    units the model actually trains on.
+    """
+
+    enabled: bool = False
+    brightness_std: float = 0.05
+    contrast_std: float = 0.05
+    noise_std: float = 0.02
+
+
+class SceneOversamplingConfig(BaseModel):
+    """Class-driven per-scene oversampling for :class:`PatchDataset`'s random
+    scene draw (see
+    :class:`landscape_change_detection_pipeline.training.train.PatchDataset`).
+
+    Unlike per-pixel class weighting (``training.class_weighting``) or a
+    hard-rebalanced sampler, this only changes *how often each scene is
+    drawn* -- the pixels within a drawn patch keep their natural class mix,
+    so a rare class gets more exposure through more varied crops of the
+    scenes that contain it, without inflating its per-pixel loss weight or
+    swamping the batch with synthetic repeats. Meant to be gentler than
+    per-pixel rebalancing when that has destabilized training (see the
+    :class:`TrainingConfig` docstring).
+
+    A scene's sampling weight is
+    ``1 + boost_factor * (rare-class pixel share in that scene)``, where the
+    "rare-class pixel share" is the fraction of the scene's labeled pixels
+    belonging to a class whose corpus-wide frequency is below
+    ``rare_class_threshold``. ``boost_factor=0`` (or ``enabled=False``)
+    reproduces the previous uniform-over-scenes behaviour exactly.
+    """
+
+    enabled: bool = False
+    rare_class_threshold: float = 0.02
+    boost_factor: float = 5.0
+    # Explicit dense class ids (position in classes.yaml, NOT the raw `id`) to
+    # treat as rare; when non-empty it replaces the rare_class_threshold rule.
+    rare_classes: list[int] = Field(default_factory=list)
+    # A scene's rare share is otherwise its rare-pixel fraction, which is tiny
+    # even for a scene that does contain the class. With a value > 0, a scene
+    # holding >= this many rare pixels counts as fully rare (share 1.0), and
+    # fewer pixels count proportionally.
+    presence_min_pixels: int = 0
+
+
+class PseudoLabelConfig(BaseModel):
+    """Semi-supervised self-training over the unlabeled scene pool under
+    ``dem.tile_dir`` (see
+    :mod:`landscape_change_detection_pipeline.training.pseudo_label`).
+
+    Only scenes with no corresponding annotated mask are eligible (the
+    annotated ones are already used directly). Because the unlabeled pool is
+    far larger than what fits in RAM or the caches already built (see the
+    module docstring), pseudo-labeling is a **separate, streaming** step run
+    with ``scripts/05b_generate_pseudo_labels.py``, not something the main
+    training loop does inline: it loads one unlabeled scene at a time,
+    predicts with an already-trained checkpoint, keeps only
+    confidence-thresholded pixels, and writes the result straight to disk in
+    the same per-scene ``.npz`` cache schema
+    :mod:`landscape_change_detection_pipeline.features.training_cache` uses for
+    real annotations -- never holding more than one scene's feature stack in
+    memory at a time, and never touching VRAM beyond one inference batch.
+
+    The resulting cache tree (``pseudo_label_root``) is then mixed into
+    training as a second, separately-weighted :class:`PatchDataset` --
+    labeled scenes keep full weight, pseudo-labeled scenes are drawn at
+    ``pseudo_label_weight`` of a real scene's sampling probability, and
+    ``pseudo_label_loss_weight`` scales their contribution to the loss, so a
+    wrong pseudo-label costs less than a wrong real one.
+    """
+
+    enabled: bool = False
+    pseudo_label_root: str = "data/pseudo_label_cache"
+    confidence_threshold: float = 0.9
+    max_scenes: Optional[int] = None
+    sensors: Optional[list[str]] = None
+    inference_batch_size: int = 32
+    # Sliding-window stride used only for pseudo-labeling. null = patch_size
+    # (no overlap, ~4x faster than the usual stride = patch_size / 2).
+    inference_stride: Optional[int] = None
+    use_amp: bool = True
+    # Threads preloading the next scenes' feature stacks while the GPU infers.
+    prefetch_workers: int = 3
+    # Rare-class handling: pixels predicted as one of ``rare_classes`` are
+    # kept at the (lower) ``rare_confidence_threshold`` instead of
+    # ``confidence_threshold``, and a scene is kept if it has at least
+    # ``min_rare_pixels`` such pixels even when its overall kept ratio is low.
+    rare_classes: list[int] = []
+    rare_confidence_threshold: float = 0.7
+    min_rare_pixels: int = 500
+    pseudo_label_weight: float = 0.3
+    pseudo_label_loss_weight: float = 0.5
+
+
 class TrainingConfig(BaseModel):
     """Training-loop hyperparameters (see
     :mod:`landscape_change_detection_pipeline.training.train`).
@@ -661,12 +914,12 @@ class TrainingConfig(BaseModel):
     """
 
     epochs: int = 100
-    batch_size: int = 16
+    batch_size: int = 32
     patch_size: int = 256
     lr: float = 3e-4
     weight_decay: float = 1e-4
     patience: int = 15
-    num_workers: int = 4
+    num_workers: int = 16
     seed: int = 0
     deterministic: bool = False
     amp: bool = True
@@ -676,6 +929,55 @@ class TrainingConfig(BaseModel):
     augment_rotate90: bool = True
     confusion_penalties: list[ConfusionPenaltyConfig] = Field(default_factory=list)
     checkpoint_dir: str = "models/checkpoints"
+
+    #: Inverse-frequency class weights in the training loss (see
+    #: :func:`landscape_change_detection_pipeline.training.losses.compute_class_weights`
+    #: and ``weighted_cross_entropy``) -- the same rebalancing
+    #: ``random_forest``/``catboost``/``lightgbm`` apply via their own
+    #: ``class_weighting``/``class_weight`` fields. Default ``True``: this
+    #: project's land-cover classes are far from evenly represented, and an
+    #: unweighted loss leaves the rarest ones under-learned.
+    class_weighting: bool = True
+
+    #: Softens ``class_weighting``: weight = (inverse frequency) ** power.
+    #: 1.0 = plain inverse frequency (can reach hundreds for a very rare class
+    #: and destabilise training); 0.5 = square root (recommended); 0 = none.
+    class_weight_power: float = 0.5
+
+    #: Hard cap on any single class weight (before renormalisation); null = no cap.
+    class_weight_max: Optional[float] = 10.0
+
+    #: Focal-loss exponent applied to the cross-entropy: 0 = off, 2 = usual.
+    #: Down-weights easy pixels so hard/rare classes drive the gradient.
+    focal_gamma: float = 0.0
+
+    #: Weight of a soft-Dice term added to the loss: 0 = off, 0.5-1.0 typical.
+    #: Every class counts equally in Dice, which helps rare classes directly.
+    dice_weight: float = 0.0
+
+    #: Radiometric jitter (brightness/contrast/noise) on top of the existing
+    #: geometric augmentation -- see :class:`RadiometricAugmentationConfig`.
+    radiometric_augmentation: RadiometricAugmentationConfig = Field(
+        default_factory=RadiometricAugmentationConfig
+    )
+
+    #: Merge classes for training/evaluation: ``{source: target}`` class names
+    #: from ``classes.yaml`` (e.g. ``built_up_infrastructure: bare_ground``).
+    #: Source pixels are relabelled as the target whenever a cached scene is
+    #: read (the caches on disk are untouched), and predictions of a source
+    #: class are folded onto the target at evaluation, pseudo-labeling and
+    #: inference. The model keeps its full output size; a source class simply
+    #: has no support. Remove merged classes from ``scene_oversampling`` /
+    #: ``pseudo_label`` ``rare_classes`` (a warning is printed otherwise).
+    class_merge: dict[str, str] = Field(default_factory=dict)
+
+    #: Class-driven per-scene oversampling -- see
+    #: :class:`SceneOversamplingConfig`.
+    scene_oversampling: SceneOversamplingConfig = Field(default_factory=SceneOversamplingConfig)
+
+    #: Semi-supervised pseudo-labeling over the unlabeled scene pool -- see
+    #: :class:`PseudoLabelConfig`.
+    pseudo_label: PseudoLabelConfig = Field(default_factory=PseudoLabelConfig)
 
 
 class HpoSearchSpaceEntry(BaseModel):
@@ -775,6 +1077,20 @@ class InferenceConfig(BaseModel):
     ``scene_precheck_min_valid_ratio`` mirrors
     ``scene_passes_precheck`` -- a scene below this finite-pixel fraction is
     marked unprocessable rather than run through the model.
+
+    ``checkpoint_path``/``tiles``/``sensors``/``device``/``workers`` are
+    ``scripts/06_run_inference.py``'s own run parameters -- config-driven,
+    like every other run parameter in this project, rather than CLI flags
+    (see this project's own convention: everything a run needs to be
+    reproduced from ``config.yaml`` alone, not from a shell history).
+    ``checkpoint_path=null`` keeps that script's own default
+    (``<training.checkpoint_dir>/<model.type>_best.<pt|joblib>``);
+    ``tiles``/``sensors`` empty means every tile/sensor found.
+    ``workers<=1`` runs sequentially in the main process; ``workers>1``
+    spreads scenes across that many worker processes (see
+    ``06_run_inference.py``'s own module docstring for why this should stay
+    small for a GPU-backed model type, e.g. ``catboost`` with
+    ``task_type=GPU``, versus a CPU-only one).
     """
 
     patch_size: int = 256
@@ -785,6 +1101,11 @@ class InferenceConfig(BaseModel):
     output_root: str = "outputs/inference"
     ambiguity_threshold: Optional[float] = None
     class_priority_order: list[int] = Field(default_factory=list)
+    checkpoint_path: Optional[str] = None
+    tiles: list[str] = Field(default_factory=list)
+    sensors: list[str] = Field(default_factory=list)
+    device: Optional[str] = None
+    workers: int = 1
 
 
 class CompositeClassRule(BaseModel):
@@ -839,97 +1160,583 @@ class CompositesConfig(BaseModel):
     class_rules: list[CompositeClassRule] = Field(default_factory=list)
     output_root: str = "outputs/composites"
 
+    #: scripts/07_build_monthly_composites.py's own run parameters --
+    #: config-driven rather than CLI flags (this project's convention: a run
+    #: must be reproducible from config.yaml alone). tiles=[] means every
+    #: tile in the registry. workers>1 builds separate tiles' composites in
+    #: parallel worker processes -- tiles are fully independent (each reads
+    #: only its own inference output and writes its own output subtree) and
+    #: this stage is CPU/numpy-only (no GPU contention to worry about, unlike
+    #: scripts/06_run_inference.py's own ``inference.workers``), so this can
+    #: reasonably scale close to the machine's core count.
+    tiles: list[str] = Field(default_factory=list)
+    overwrite: bool = False
+    workers: int = 1
 
-class CcdcConfig(BaseModel):
-    """Local CCDC/COLD change-detection parameters (see
-    :mod:`landscape_change_detection_pipeline.change.ccdc`).
 
-    ``lam``/``p_cg``/``conse`` mirror pyxccd's ``cold_detect_flex`` kwargs of
-    the same names (Lasso regularization weight, change-magnitude
-    probability threshold, consecutive-observation count to confirm a
-    break); defaults match pyxccd's own and GEE CCDC's documented defaults.
-    ``min_clear_obs`` guards against fitting a pixel with too little usable
-    history (permanently cloud/shadow-flagged, or too few scenes) --
-    pyxccd's own COLD initialization needs a minimum window of clear
-    observations to fit meaningfully. ``n_workers`` spreads pixels across
-    local CPU cores via ``multiprocessing`` (never GPU -- no CUDA path
-    exists for this algorithm).
+class ChangeDetectionConfig(BaseModel):
+    """Per-pixel temporal segmentation parameters (see
+    :mod:`landscape_change_detection_pipeline.change.segmentation` for the
+    method and :mod:`landscape_change_detection_pipeline.change.change_detection`
+    for the tile driver).
+
+    ``features`` are the spectral indices each pixel's series is built from
+    (names from :data:`change.spectral_composites.ALL_INDEX_NAMES`); indices
+    are normalised ratios or fixed linear combinations of the bands, so they
+    stay comparable across Landsat 5/7/8/9 and Sentinel-2. ``NBR`` and
+    ``NDVI`` are required: later stages read burn severity from the first
+    and vegetation state from the second. ``masked_classes`` are class names
+    whose observations are not used at all (states that are not the land
+    surface: cloud, shadow, snow, ice, open water).
+
+    ``p_change`` is the chi-square probability level of the per-observation
+    change test; ``conse`` how many consecutive observations must all exceed
+    it to confirm a break -- lower it for sparser data, raise it for denser
+    data. ``init_obs``/``init_min_span_days`` size the initial window of each
+    segment; ``stability_threshold`` (in residual standard deviations) is how
+    much trend/end-residual that window may show; ``min_rmse`` floors each
+    feature's residual scale (index units) so a near-perfect fit cannot make
+    every observation look anomalous; ``max_harmonics`` (1-3) caps the
+    seasonal model; ``outlier_p`` is the probability level above which an
+    isolated observation in the initial window is discarded; ``max_segments``
+    caps segments per pixel (a pixel that would exceed it is flagged
+    ``truncated``).
+
+    ``start_year``/``end_year`` bound the time series (``end_year=null``: to
+    the latest scene). ``tiles=[]`` means every tile in the registry.
+    ``block_rows`` is the row-block height of the temporary scene cube (memory
+    per block scales with it); ``io_threads`` scenes are decoded at once;
+    ``numba_threads=0`` uses every core for the per-pixel computation.
     """
 
-    lam: float = 20.0
-    p_cg: float = 0.99
-    conse: int = 6
-    min_clear_obs: int = 12
-    n_workers: int = 1
-    output_root: str = "outputs/ccdc"
+    output_root: str = "outputs/change_detection"
+    tiles: list[str] = Field(default_factory=list)
+    overwrite: bool = False
+
+    start_year: int = 1984
+    end_year: Optional[int] = None
+    features: list[str] = Field(default_factory=lambda: ["NBR", "NDVI", "NDWI_GAO", "TC_BRIGHTNESS"])
+    masked_classes: list[str] = Field(
+        default_factory=lambda: ["cloud", "shadow", "snow_cover", "ice_cover", "open_water"]
+    )
+
+    p_change: float = 0.999
+    conse: int = 4
+    init_obs: int = 18
+    init_min_span_days: int = 365
+    stability_threshold: float = 3.0
+    min_rmse: float = 0.03
+    max_harmonics: int = 3
+    outlier_p: float = 0.999999
+    max_segments: int = 16
+    use_slope_interaction: bool = False
+    """Adds, per non-reference sensor, one extra model column of
+    ``terrain_slope * sensor_indicator`` alongside the plain per-sensor
+    fixed effect (see change.segmentation's module docstring) -- lets each
+    sensor's own radiometric offset scale with this pixel's own DEM slope,
+    since cross-sensor TOA residuals are known to be worse on steep terrain
+    (see scenes/harmonize.py). Experimental: evaluate against the plain
+    per-sensor offset (``use_slope_interaction: false``) before relying on
+    it, since it roughly doubles the sensor-related columns fit per pixel."""
+
+    min_magnitude: float = 0.1
+    """A statistically confirmed break is kept only if the shift (median of
+    the confirming observations minus median of the last pre-break ones)
+    reaches this size on at least one of ``magnitude_features``; a smaller
+    shift is absorbed into the segment's model. 0 disables the filter."""
+    magnitude_features: list[str] = Field(default_factory=lambda: ["NBR", "NDVI"])
+    min_break_span_days: int = 45
+    """The confirming run of exceedances must also span this many days,
+    whatever ``conse`` -- dense Sentinel-2 revisits otherwise confirm a break
+    from a couple of weeks of seasonal misfit. 0 disables."""
+    refit_every: int = 3
+    """Refit a segment's model every this many accepted observations once it
+    has 30 (each fit is the costliest step of monitoring). 1 = every one."""
+    aggregate_days: int = 15
+    """Aggregate observations into bins of this many days (per sensor, per-
+    pixel median of the usable ones) before segmenting: faster, less noisy,
+    and a run of ``conse`` exceedances then means a sustained change. 0 = use
+    every scene as is (slow, and dense Sentinel-2 gives false breaks)."""
+
+    season_window: Optional[list[int]] = Field(default_factory=lambda: [152, 258])
+    """``[first_doy, last_doy]``: only observations whose calendar day of year
+    falls inside are used (default 152-258, about 1 June - 15 September, the
+    growing season). Snowmelt, leaf fall and low sun are what the annual
+    harmonics model badly, and they produced most of the seasonal false
+    breaks. Break dates are then only as precise as the season. The
+    harmonic count is forced to 1 when a window is active. ``null``/``[]`` =
+    use the whole year."""
+    min_magnitude_same_class: float = 0.2
+    """Stricter ``min_magnitude`` for a break after which the land-cover class
+    is unchanged (thinning, phenology, sensor drift look like that). 0 = same
+    threshold as ``min_magnitude``."""
+    persist_days: int = 300
+    """A break must still be visible (same sign, at least half of
+    ``min_magnitude`` on one of ``magnitude_features``) in the first
+    observations at least this many days after it. Breaks too close to the end
+    of the series to verify are kept. 0 disables."""
+    min_obs_break_year: int = 8
+    """A break needs at least this many usable observations within a year of
+    its date (sparse years make any offset look like a break). 0 disables."""
+
+    block_rows: int = 50
+    io_threads: int = 4
+    numba_threads: int = 0
+
+    @field_validator("season_window")
+    @classmethod
+    def _validate_season_window(cls, value):
+        if value:
+            if len(value) != 2 or not (1 <= value[0] < value[1] <= 366):
+                raise ValueError(f"change_detection.season_window must be [first_doy, last_doy] within 1-366, got {value}")
+        return value
+
+    @field_validator("magnitude_features")
+    @classmethod
+    def _validate_magnitude_features(cls, value: list[str], info) -> list[str]:
+        feats = info.data.get("features")
+        if feats is not None:
+            unknown = [v for v in value if v not in feats]
+            if unknown:
+                raise ValueError(f"change_detection.magnitude_features {unknown} must be among features {feats}")
+        return value
+
+    @field_validator("features")
+    @classmethod
+    def _validate_features(cls, value: list[str]) -> list[str]:
+        for required in ("NBR", "NDVI"):
+            if required not in value:
+                raise ValueError(f"change_detection.features must include {required}, got {value!r}")
+        if len(set(value)) != len(value):
+            raise ValueError(f"change_detection.features has duplicates: {value!r}")
+        return value
+
+    @field_validator("p_change", "outlier_p")
+    @classmethod
+    def _validate_probability(cls, value: float) -> float:
+        if not 0.0 < value < 1.0:
+            raise ValueError(f"probability must be strictly between 0 and 1, got {value}")
+        return value
+
+    @field_validator("conse")
+    @classmethod
+    def _validate_conse(cls, value: int) -> int:
+        if value < 2:
+            raise ValueError(f"change_detection.conse must be >= 2, got {value}")
+        return value
+
+    @field_validator("max_harmonics")
+    @classmethod
+    def _validate_harmonics(cls, value: int) -> int:
+        if value not in (1, 2, 3):
+            raise ValueError(f"change_detection.max_harmonics must be 1, 2 or 3, got {value}")
+        return value
+
+    @field_validator("init_obs")
+    @classmethod
+    def _validate_init_obs(cls, value: int) -> int:
+        if value < 8:
+            raise ValueError(f"change_detection.init_obs must be >= 8, got {value}")
+        return value
 
 
-class BfastConfig(BaseModel):
-    """BFAST-Monitor fire cross-check parameters (see
-    :mod:`landscape_change_detection_pipeline.change.bfast`).
+class SnowWaterDynamicsConfig(BaseModel):
+    """Per-pixel, per-water-year snow/ice/open-water summary parameters (see
+    :mod:`landscape_change_detection_pipeline.change.snow_water_dynamics`).
 
-    ``monitor_start`` (``"YYYY-MM-DD"``) splits each tile's time series into
-    the stable history period (before) and the monitoring period being
-    tested (on/after) -- the same split for every tile/pixel, since BFAST-
-    Monitor's near-real-time framing assumes one fixed "as of" boundary
-    rather than a per-pixel one. ``order``/``alpha`` are the harmonic
-    regression order and CUSUM significance level (see the module's own
-    docstring for the exact formulas). ``n_workers`` mirrors
-    ``ccdc.n_workers`` -- CPU processes, never GPU (no CUDA path exists for
-    this algorithm either).
+    Reads Stage 7's monthly class composites directly (``composites.output_root``)
+    -- the classifier's own snow_cover/ice_cover/open_water class, never a
+    spectral-index reading of the same thing (this is deliberately a
+    different, categorical signal from ``change_detection``'s continuous
+    vegetation-index trend model, which excludes these classes for the
+    opposite reason -- see that module's own docstring).
+
+    ``water_year_start_month`` (1-12, default 10 = October, Water Survey of
+    Canada's standard) groups months into water years so one winter is
+    never split across two summary rows.
+
+    ``tiles``/``overwrite``/``workers`` are
+    ``scripts/10_build_snow_water_dynamics.py``'s own run parameters --
+    config-driven rather than CLI flags (this project's convention: a run
+    must be reproducible from ``config.yaml`` alone). ``tiles=[]`` means
+    every tile in the registry. ``workers>1`` builds separate tiles in
+    parallel worker processes -- tiles are fully independent here and this
+    stage does no internal multi-core work of its own (unlike
+    ``change_detection``'s Numba pass), so it benefits from inter-tile
+    parallelism the way ``mosaic`` does.
     """
 
-    monitor_start: str = "2020-01-01"
-    order: int = 3
-    alpha: float = 0.05
-    min_history_obs: int = 12
-    min_monitoring_obs: int = 3
-    n_workers: int = 1
-    output_root: str = "outputs/bfast"
+    output_root: str = "outputs/snow_water_dynamics"
+    tiles: list[str] = Field(default_factory=list)
+    overwrite: bool = False
+    water_year_start_month: int = 10
+    workers: int = 1
+
+    @field_validator("water_year_start_month")
+    @classmethod
+    def _validate_water_year_start_month(cls, value: int) -> int:
+        if not 1 <= value <= 12:
+            raise ValueError(f"snow_water_dynamics.water_year_start_month must be 1-12, got {value}")
+        return value
 
 
 class RegrowthSeverityConfig(BaseModel):
     """NDVI regrowth / dNBR burn severity parameters (see
     :mod:`landscape_change_detection_pipeline.change.regrowth_severity`).
 
-    ``break_source`` selects which break-detection output supplies each
-    pixel's disturbance date -- ``"ccdc"`` (general breaks) or ``"bfast"``
-    (fire-specific cross-check). No NDSI snow filter here by design -- the
-    trained classifier's own ``snow_cover`` class already answers that
-    question from the same composites this module reads; see
-    :mod:`change.regrowth_severity`'s own module docstring for why dNBR and
-    NDVI regrowth earn a separate representation but snow does not.
+    Reads each pixel's most recent break date from
+    ``change_detection.output_root``'s segment table (Stage 09). No NDSI
+    snow filter here by design -- the trained classifier's own
+    ``snow_cover`` class already answers that question from the same
+    composites this module reads; see :mod:`change.regrowth_severity`'s own
+    module docstring for why dNBR and NDVI regrowth earn a separate
+    representation but snow does not.
+
+    ``tiles``/``overwrite``/``workers`` are
+    ``scripts/11_build_regrowth_severity.py``'s own run parameters --
+    config-driven rather than CLI flags (this project's convention: a run
+    must be reproducible from ``config.yaml`` alone). ``tiles=[]`` means
+    every tile in the registry. ``workers>1`` builds separate tiles in
+    parallel worker processes -- tiles are fully independent here and this
+    stage does no internal multi-core work of its own (unlike
+    ``change_detection``'s Numba pass), so it benefits from inter-tile
+    parallelism the way ``mosaic`` does.
     """
 
-    break_source: str = "ccdc"
     output_root: str = "outputs/regrowth_severity"
+    tiles: list[str] = Field(default_factory=list)
+    overwrite: bool = False
+    workers: int = 1
+    month_threads: int = 4
+    """Monthly composites (the expensive part: reading each month's scenes and
+    reducing them) are computed this many months ahead in threads inside one
+    tile. Multiply by ``workers`` for the total; memory is one month's
+    composite per thread. 1 = sequential."""
 
-    @field_validator("break_source")
+
+class EventTypingConfig(BaseModel):
+    """Naming of change events from the detected surface states (see
+    :mod:`landscape_change_detection_pipeline.change.event_typing`).
+
+    Cultivated agriculture, cutblock and built-up are *not* classes of the
+    classifier (they are uses, not surface states): they are read from the
+    monthly class series of each pixel (Stage 07 composites), only within a
+    growing season, and -- for the abrupt cutblock/fire events -- from Stage
+    09's breaks. Cloud/shadow/snow/ice months (``masked_classes``) are
+    unobserved.
+
+    Cropland: within ``crop_season`` (month range, default May-October) a year
+    cycles when bare ground and grassland each show at least
+    ``crop_min_months_per_year`` observed months; cultivation must then cycle every
+    observed year from its first year to the end of the series, for at least
+    ``crop_min_run_years`` years (``crop_allowed_gaps`` non-cycling observed years
+    tolerated), with at most ``crop_max_forest_fraction`` forest.
+
+    Cutblock: a break with forest in the ``pre_seasons`` observed seasons
+    before (at least ``min_fraction`` forest), then at least
+    ``min_cleared_years`` consecutive observed seasons of ``cutblock_season``
+    (default May-October) that are not forest (at most ``end_fraction``
+    forest) and not burned, then forest again (``min_fraction``) -- the
+    duration and recovery year are kept. A season needs ``min_season_obs``
+    observed months. ``min_drop`` is the NBR/NDVI fall that makes a break a
+    loss; ``burn_min_fraction`` the burned share that makes it a fire;
+    ``permanent_years``/``permanent_bare_fraction`` a clearing that never
+    recovers for that long and is mostly bare (road/pad/mine/built candidate).
+    """
+
+    output_root: str = "outputs/change_events"
+    tiles: list[str] = Field(default_factory=list)
+    overwrite: bool = False
+    forest_class: str = "forest"
+    grass_class: str = "grassland_herbaceous"
+    bare_class: str = "bare_ground"
+    burned_class: str = "burned_disturbed"
+    masked_classes: list[str] = Field(default_factory=lambda: ["cloud", "shadow", "snow_cover", "ice_cover"])
+    min_drop: float = 0.15
+    min_fraction: float = 0.8
+    end_fraction: float = 0.2
+    burn_min_fraction: float = 0.4
+    cutblock_season: list[int] = Field(default_factory=lambda: [5, 10])
+    min_season_obs: int = 2
+    pre_seasons: int = 2
+    min_cleared_years: int = 3
+    permanent_years: float = 8.0
+    permanent_bare_fraction: float = 0.6
+    crop_season: list[int] = Field(default_factory=lambda: [5, 10])
+    crop_min_months_per_year: int = 2
+    crop_min_run_years: int = 4
+    crop_max_forest_fraction: float = 0.0
+    crop_allowed_gaps: int = 0
+
+    @field_validator("cutblock_season", "crop_season")
     @classmethod
-    def _validate_break_source(cls, value: str) -> str:
-        if value not in ("ccdc", "bfast"):
-            raise ValueError(f"regrowth_severity.break_source must be 'ccdc' or 'bfast', got {value!r}")
+    def _validate_season(cls, value: list[int]) -> list[int]:
+        if len(value) != 2 or not (1 <= value[0] <= value[1] <= 12):
+            raise ValueError(f"event_typing season must be [first_month, last_month] within 1-12, got {value}")
         return value
 
 
-class IndexCompositesConfig(BaseModel):
-    """Monthly per-tile spectral-index composite parameters (see
-    :mod:`landscape_change_detection_pipeline.change.spectral_composites`) --
-    analysis-only NDVI/NDSI/NBR/Tasseled-Cap/etc. statistics, never fed to
-    the land-cover model. No reduction-rule knobs here (unlike
-    ``composites``): every index always keeps median/min/max/n_obs
-    unconditionally, since which statistic a given change-detection layer
-    needs varies by layer, not by a single global config choice."""
+class LandcoverPersistenceConfig(BaseModel):
+    """Persistent land-cover object tracking parameters (see
+    :mod:`landscape_change_detection_pipeline.change.landcover_persistence`).
 
-    output_root: str = "outputs/index_composites"
+    Reads Stage 7's monthly class composites (``composites.output_root``)
+    directly, plus Stage 09's segment table (``change_detection.output_root``)
+    for ``burned_disturbed``'s appearance date specifically -- see that
+    module's own docstring for why ``burned_disturbed`` reuses Stage 09's
+    break date instead of being detected purely from the monthly-composite
+    majority vote every other tracked class uses.
+
+    ``tracked_classes`` names must exist in ``configs/classes.yaml``.
+
+    ``window_size``/``min_fraction`` control the sliding-window majority
+    vote that confirms a class transition (see the module docstring for why
+    a proportional vote over *observed* months, not a strict N-consecutive
+    rule): within the last ``window_size`` observed months, at least
+    ``min_fraction`` of them must show the tracked class to confirm it
+    present. No single "right" default exists here -- tune against real
+    output (too many short-lived spurious intervals means raising
+    ``min_fraction`` or ``window_size``; missed real transitions means
+    lowering either).
+
+    ``tiles``/``overwrite``/``workers`` are
+    ``scripts/12_build_landcover_persistence.py``'s own run parameters --
+    config-driven rather than CLI flags (this project's convention: a run
+    must be reproducible from ``config.yaml`` alone). ``tiles=[]`` means
+    every tile in the registry. ``workers>1`` builds separate tiles in
+    parallel worker processes -- tiles are fully independent here and this
+    stage does no internal multi-core work of its own (unlike
+    ``change_detection``'s Numba pass), so it benefits from inter-tile
+    parallelism the way ``mosaic`` does.
+    """
+
+    output_root: str = "outputs/landcover_persistence"
+    tiles: list[str] = Field(default_factory=list)
+    overwrite: bool = False
+    workers: int = 1
+    tracked_classes: list[str] = Field(
+        default_factory=lambda: [
+            "burned_disturbed",
+        ]
+    )
+    window_size: int = 5
+    min_fraction: float = 0.8
+    end_fraction: float = 0.2
+    """The class ends once at most this fraction of the last ``window_size``
+    observed months shows it (must be below ``min_fraction``: hysteresis, one
+    odd month never closes an interval)."""
+    masked_classes: list[str] = Field(default_factory=lambda: ["cloud", "shadow", "snow_cover", "ice_cover"])
+    """Classes whose months are *unobserved* for the vote (neither for nor
+    against the tracked class): cloud/shadow/snow/ice cover the ground, they
+    say nothing about what is under them."""
+    default_min_duration_months: int = 12
+    min_duration_months: dict[str, int] = Field(default_factory=dict)
+    """Intervals shorter than this many months are dropped (per-class
+    override in ``min_duration_months``, else the default)."""
+    require_break_classes: list[str] = Field(default_factory=lambda: ["burned_disturbed"])
+    """Abrupt-event classes: an interval is kept only if Stage 09 found a
+    break with an NBR/NDVI fall of at least ``min_break_drop`` between
+    ``break_tolerance_months`` before and ``break_after_months`` after its
+    start (the break month then becomes the start date)."""
+    break_tolerance_months: int = 18
+    break_after_months: int = 6
+    min_break_drop: float = 0.1
+
+    @field_validator("window_size")
+    @classmethod
+    def _validate_window_size(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError(f"landcover_persistence.window_size must be >= 1, got {value}")
+        return value
+
+    @field_validator("min_fraction")
+    @classmethod
+    def _validate_min_fraction(cls, value: float) -> float:
+        if not 0.0 < value <= 1.0:
+            raise ValueError(f"landcover_persistence.min_fraction must be in (0, 1], got {value}")
+        return value
 
 
-class IndexMosaicConfig(BaseModel):
-    """AOI-wide spectral-index mosaic parameters (see
-    :mod:`landscape_change_detection_pipeline.change.index_mosaic`) -- the continuous-
-    index counterpart of ``mosaic`` (Stage 8's categorical class mosaic)."""
+class PhenologyConfig(BaseModel):
+    """Per-year phenology of every pixel (peak month, start/end/length of the season)."""
 
-    output_root: str = "outputs/index_mosaics"
+    enabled: bool = True
+    sos_fraction: float = 0.5
+    """Season start/end = the date the (interpolated) monthly curve crosses
+    ``low + sos_fraction * (peak - low)``, ``low`` being the pixel's
+    ``baseline_percentile`` of all its observations."""
+    baseline_percentile: float = 10.0
+    min_amplitude: float = 0.08
+    """Peak-minus-low below this = no seasonal cycle that year (nothing written)."""
+    max_gap_months: int = 2
+    """Interpolating across more consecutive unobserved months than this is refused."""
+    trends: bool = True
+    """Also fit a trend (Theil-Sen + Mann-Kendall) on the yearly start/end/length series."""
+
+    @field_validator("sos_fraction")
+    @classmethod
+    def _validate_fraction(cls, value: float) -> float:
+        if not 0.0 < value < 1.0:
+            raise ValueError(f"vegetation_dynamics.phenology.sos_fraction must be in (0, 1), got {value}")
+        return value
+
+
+class TrendConfig(BaseModel):
+    """Slow greening / browning: Theil-Sen slope + Mann-Kendall test on the yearly series."""
+
+    enabled: bool = True
+    series: list[str] = Field(default_factory=lambda: ["growing_season_mean", "annual_max"])
+    min_years: int = 8
+    since_last_break: bool = True
+    """Also fit the trend on the years after each pixel's latest Stage 09 break
+    (a trend fitted across a clear-cut says nothing about slow change)."""
+
+    @field_validator("series")
+    @classmethod
+    def _validate_series(cls, value: list[str]) -> list[str]:
+        bad = [v for v in value if v not in ("growing_season_mean", "annual_max")]
+        if bad:
+            raise ValueError(f"vegetation_dynamics.trend.series: unknown {bad}; use growing_season_mean / annual_max")
+        return value
+
+
+class AnomalyConfig(BaseModel):
+    """Monthly z-score against the pixel's own climatology (same calendar month)."""
+
+    enabled: bool = True
+    robust: bool = True
+    """median / MAD instead of mean / standard deviation: a disturbance in the
+    baseline then does not inflate the scale."""
+    baseline_years: Optional[list[int]] = None
+    """[first_year, last_year] the climatology is computed on; null = every year."""
+    min_clim_obs: int = 5
+    min_scale: float = 0.02
+    extreme_z: float = 2.0
+    store_monthly: bool = False
+    """Also write the full monthly z-score cube (n_months x H x W float16) to its own file. Large."""
+
+    @field_validator("baseline_years")
+    @classmethod
+    def _validate_baseline(cls, value):
+        if value is not None and (len(value) != 2 or value[0] > value[1]):
+            raise ValueError(f"vegetation_dynamics.anomalies.baseline_years must be [first, last], got {value}")
+        return value
+
+
+class VariabilityConfig(BaseModel):
+    """Interannual variability of the yearly series (coefficient of variation, year-to-year change)."""
+
+    enabled: bool = True
+    min_years: int = 5
+
+
+class VegetationDynamicsConfig(BaseModel):
+    """Per-pixel vegetation dynamics from the monthly index series (see
+    :mod:`landscape_change_detection_pipeline.change.vegetation_dynamics`).
+
+    Builds, once per tile, a monthly cube of each index in ``indices`` on the
+    Stage 09 grid (cloud/shadow already excluded, plus the months whose
+    class composite is one of ``mask_classes`` -- snow, ice, water -- since a
+    vegetation index under snow is not vegetation), stored as a temporary
+    on-disk cube deleted at the end. Every element below can be switched off
+    on its own with ``enabled``.
+
+    ``workers>1`` runs tiles in parallel processes; memory per worker is the
+    yearly output arrays (a few hundred MB for an 8 km tile), the cube itself
+    is on disk.
+    """
+
+    enabled: bool = True
+    output_root: str = "outputs/vegetation_dynamics"
+    tiles: list[str] = Field(default_factory=list)
+    overwrite: bool = False
+    workers: int = 1
+    month_threads: int = 4
+    block_rows: int = 64
+    indices: list[str] = Field(default_factory=lambda: ["NDVI"])
+    growing_season: list[int] = Field(default_factory=lambda: [5, 10])
+    min_gs_obs: int = 2
+    """Observed growing-season months a year needs for its yearly mean/max."""
+    min_year_obs: int = 5
+    """Observed months (whole year) a year needs for a phenology fit."""
+    mask_classes: list[str] = Field(default_factory=lambda: ["cloud", "shadow", "snow_cover", "ice_cover", "open_water"])
+    phenology: PhenologyConfig = Field(default_factory=PhenologyConfig)
+    trend: TrendConfig = Field(default_factory=TrendConfig)
+    anomalies: AnomalyConfig = Field(default_factory=AnomalyConfig)
+    variability: VariabilityConfig = Field(default_factory=VariabilityConfig)
+
+    @field_validator("growing_season")
+    @classmethod
+    def _validate_season(cls, value: list[int]) -> list[int]:
+        if len(value) != 2 or not (1 <= value[0] <= value[1] <= 12):
+            raise ValueError(f"vegetation_dynamics.growing_season must be [first_month, last_month] within 1-12, got {value}")
+        return value
+
+    @field_validator("indices")
+    @classmethod
+    def _validate_indices(cls, value: list[str]) -> list[str]:
+        if not value:
+            raise ValueError("vegetation_dynamics.indices must list at least one index (e.g. [NDVI])")
+        return value
+
+
+class RecoveryCurvesConfig(BaseModel):
+    """Yearly index after each event, relative to the pre-event level."""
+
+    enabled: bool = True
+    max_years: int = 20
+    """Years after the event's break year kept in the curve (0..max_years)."""
+    pre_years: int = 3
+    """Years before the break year whose median is the pre-event baseline."""
+    min_pre_years: int = 2
+    recovery_threshold: float = 0.8
+    """Recovered = the yearly value is back to this share of the baseline..."""
+    sustain_years: int = 2
+    """... for this many observed years in a row (a one-year spike is not recovery)."""
+
+
+class SuccessionConfig(BaseModel):
+    """Dominant class of the growing season, year by year after each event."""
+
+    enabled: bool = True
+    max_years: int = 20
+    min_season_obs: int = 2
+    forest_class: str = "forest"
+
+
+class RecoveryFactorsConfig(BaseModel):
+    """What explains the recovery: terrain, event type, severity, pre-event level (tables + binned summary)."""
+
+    enabled: bool = True
+    elevation_bins_m: list[float] = Field(default_factory=lambda: [0, 500, 1000, 1500, 2000, 4000])
+    slope_bins_deg: list[float] = Field(default_factory=lambda: [0, 5, 15, 30, 90])
+    aspect_sectors: int = 8
+    min_group_size: int = 5
+    """Groups smaller than this are left out of the binned summary."""
+
+
+class RecoveryAnalysisConfig(BaseModel):
+    """Recovery / succession analysis of every named change event (see
+    :mod:`landscape_change_detection_pipeline.change.recovery_analysis`).
+
+    Needs Stage 09 (grid), Stage 12 (``event_typing.output_root``: the events)
+    and the same monthly index cube as ``vegetation_dynamics`` (built in the
+    same run of ``scripts/14_build_vegetation_dynamics.py``). The DEM
+    (``dem.tile_dir``) is optional: without it the terrain columns are NaN.
+    Every element has its own ``enabled``.
+    """
+
+    enabled: bool = True
+    output_root: str = "outputs/recovery_analysis"
+    overwrite: bool = False
+    index: str = "NDVI"
+    """The index (one of ``vegetation_dynamics.indices``) the curves are built on."""
+    event_types: list[str] = Field(
+        default_factory=lambda: ["fire", "cutblock", "permanent_clearing", "canopy_decline", "other_loss"]
+    )
+    curves: RecoveryCurvesConfig = Field(default_factory=RecoveryCurvesConfig)
+    succession: SuccessionConfig = Field(default_factory=SuccessionConfig)
+    factors: RecoveryFactorsConfig = Field(default_factory=RecoveryFactorsConfig)
 
 
 class ChangeMapsConfig(BaseModel):
@@ -948,11 +1755,24 @@ class ChangeMapsConfig(BaseModel):
     ``ccdc``/``bfast`` results are read from their own already-configured
     ``ccdc.output_root``/``bfast.output_root`` -- nothing new to configure
     for where those come from.
+
+    ``tiles``/``overwrite``/``workers`` are ``scripts/13_build_change_maps.py``'s
+    own run parameters -- config-driven rather than CLI flags (this
+    project's convention: a run must be reproducible from ``config.yaml``
+    alone). ``tiles=[]`` means every tile in the registry. ``workers>1``
+    builds separate tiles in parallel worker processes (every comparison
+    pair for one tile still runs sequentially within its own worker) --
+    tiles are fully independent here and this stage does no internal
+    multi-core work of its own (unlike ``change_detection``'s Numba pass),
+    so it benefits from inter-tile parallelism the way ``mosaic`` does.
     """
 
     persistence_periods: int = 1
     corroboration_window_days: int = 45
     output_root: str = "outputs/change_maps"
+    tiles: list[str] = Field(default_factory=list)
+    overwrite: bool = False
+    workers: int = 1
 
 
 class MosaicConfig(BaseModel):
@@ -963,9 +1783,22 @@ class MosaicConfig(BaseModel):
     nearest-neighbour-resampled up to it -- so there is no
     resolution field to configure here. ``output_root`` holds one
     ``<period>/mosaic.tif`` Cloud-Optimized GeoTIFF per period.
+
+    ``periods``/``overwrite``/``workers`` are ``scripts/08_build_mosaics.py``'s
+    own run parameters -- config-driven rather than CLI flags (this
+    project's convention: a run must be reproducible from ``config.yaml``
+    alone). ``periods=[]`` means every period with at least one tile
+    composite. ``workers>1`` builds separate periods' mosaics in parallel
+    worker processes -- periods are fully independent (each reads only that
+    period's tile composites and writes its own output subtree) and this
+    stage is CPU/numpy-only (no GPU contention), so this can reasonably
+    scale close to the machine's core count.
     """
 
     output_root: str = "outputs/mosaics"
+    periods: list[str] = Field(default_factory=list)
+    overwrite: bool = False
+    workers: int = 1
 
 
 class PipelineConfig(BaseModel):
@@ -989,12 +1822,14 @@ class PipelineConfig(BaseModel):
     inference: InferenceConfig = Field(default_factory=InferenceConfig)
     composites: CompositesConfig = Field(default_factory=CompositesConfig)
     mosaic: MosaicConfig = Field(default_factory=MosaicConfig)
-    index_composites: IndexCompositesConfig = Field(default_factory=IndexCompositesConfig)
-    index_mosaic: IndexMosaicConfig = Field(default_factory=IndexMosaicConfig)
-    ccdc: CcdcConfig = Field(default_factory=CcdcConfig)
-    bfast: BfastConfig = Field(default_factory=BfastConfig)
+    change_detection: ChangeDetectionConfig = Field(default_factory=ChangeDetectionConfig)
+    snow_water_dynamics: SnowWaterDynamicsConfig = Field(default_factory=SnowWaterDynamicsConfig)
     regrowth_severity: RegrowthSeverityConfig = Field(default_factory=RegrowthSeverityConfig)
+    landcover_persistence: LandcoverPersistenceConfig = Field(default_factory=LandcoverPersistenceConfig)
+    event_typing: EventTypingConfig = Field(default_factory=EventTypingConfig)
     change_maps: ChangeMapsConfig = Field(default_factory=ChangeMapsConfig)
+    vegetation_dynamics: VegetationDynamicsConfig = Field(default_factory=VegetationDynamicsConfig)
+    recovery_analysis: RecoveryAnalysisConfig = Field(default_factory=RecoveryAnalysisConfig)
 
 
 def _substitute_env_vars(raw_text: str) -> str:

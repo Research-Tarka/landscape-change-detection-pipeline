@@ -3,8 +3,9 @@
 Purpose
 -------
 The final integration layer: combines classification-based change (Stage 7's
-monthly composites, compared across periods), CCDC/BFAST break detection,
-and dNBR into one landscape-change output per tile per period pair -- as
+monthly composites, compared across periods), per-pixel break detection
+(:mod:`change.change_detection`), and dNBR into one landscape-change output
+per tile per period pair -- as
 separate bands, never collapsed into one opaque "changed" bit, so a
 downstream consumer (an external pipeline, or a human analyst) can
 weight each signal independently. Per the project's explicit direction,
@@ -22,10 +23,10 @@ side rather than choosing one:
   short persistence window was chosen deliberately, per the project's
   explicit direction, precisely so a real-but-brief disturbance is not
   filtered out the way a long persistence requirement would).
-- **corroborated**: ``changed`` (raw) narrowed to pixels where CCDC or
-  BFAST *also* detected a break near the same date -- the strongest
-  available confidence signal, at the cost of only covering pixels/periods
-  where break detection actually ran successfully.
+- **corroborated**: ``changed`` (raw) narrowed to pixels where the per-pixel
+  temporal segmentation *also* detected a break near the same date -- the
+  strongest available confidence signal, at the cost of only covering
+  pixels/periods where break detection actually ran successfully.
 
 Cloud/shadow handling
 ------------------------
@@ -50,8 +51,8 @@ Two comparison modes
 
 Grid
 ----
-All comparisons happen on the break-detection grid
-(:mod:`change.ccdc`/:mod:`change.bfast`'s fixed per-tile grid), for the same
+All comparisons happen on the segmentation grid
+(:mod:`change.change_detection`'s fixed per-tile grid), for the same
 reason :mod:`change.regrowth_severity` reprojects onto it rather than the
 reverse: this module reads the same monthly
 composites and break results that module does.
@@ -221,40 +222,29 @@ def compute_corroborated_change(
     raw_changed: np.ndarray,
     from_month: str,
     to_month: str,
-    ccdc_result: Optional[dict],
-    bfast_result: Optional[dict],
+    segments_result: Optional[dict],
     corroboration_window_days: int = DEFAULT_CORROBORATION_WINDOW_DAYS,
 ) -> np.ndarray:
-    """Raw change narrowed to pixels where CCDC and/or BFAST also detected a
-    break within ``corroboration_window_days`` of the ``[from_month,
-    to_month]`` boundary -- the strongest-confidence band (see module
-    docstring). ``ccdc_result``/``bfast_result`` are the dicts
-    ``change.ccdc.read_ccdc_result``/``change.bfast.read_bfast_result``
-    return; either may be ``None`` if that detector's output is not
-    available for this tile, in which case it simply contributes nothing
-    (this band still reflects whichever detector(s) *are* available, rather
-    than requiring both)."""
+    """Raw change narrowed to pixels where the per-pixel temporal
+    segmentation (:mod:`change.change_detection`) also detected a break
+    within ``corroboration_window_days`` of the ``[from_month, to_month]``
+    boundary -- the strongest-confidence band (see module docstring).
+    ``segments_result`` is the dict ``change.change_detection.read_segments``
+    returns; ``None`` if no segmentation output is available for this tile,
+    in which case this band is simply empty."""
     boundary_ordinal = _month_start_ordinal(to_month)
     window_start = boundary_ordinal - corroboration_window_days
     window_end = boundary_ordinal + corroboration_window_days
 
     corroborated = np.zeros_like(raw_changed, dtype=bool)
+    if segments_result is None:
+        return corroborated
 
-    if ccdc_result is not None:
-        in_window = (ccdc_result["t_break"] > 0) & (ccdc_result["t_break"] >= window_start) & (ccdc_result["t_break"] <= window_end)
-        for row, col in zip(ccdc_result["row"][in_window], ccdc_result["col"][in_window]):
-            if raw_changed[row, col]:
-                corroborated[row, col] = True
-
-    if bfast_result is not None:
-        in_window = (
-            bfast_result["has_break"]
-            & (bfast_result["break_date"] >= window_start)
-            & (bfast_result["break_date"] <= window_end)
-        )
-        for row, col in zip(bfast_result["row"][in_window], bfast_result["col"][in_window]):
-            if raw_changed[row, col]:
-                corroborated[row, col] = True
+    t_break = segments_result["t_break"]
+    in_window = (t_break > 0) & (t_break >= window_start) & (t_break <= window_end)
+    for row, col in zip(segments_result["row"][in_window], segments_result["col"][in_window]):
+        if raw_changed[row, col]:
+            corroborated[row, col] = True
 
     return corroborated
 
@@ -314,8 +304,7 @@ def build_change_map(
     dst_shape: tuple[int, int],
     class_config: ClassConfig,
     resolution_m: float,
-    ccdc_result: Optional[dict] = None,
-    bfast_result: Optional[dict] = None,
+    segments_result: Optional[dict] = None,
     dnbr: Optional[np.ndarray] = None,
     persistence_periods: int = 1,
     corroboration_window_days: int = DEFAULT_CORROBORATION_WINDOW_DAYS,
@@ -335,7 +324,7 @@ def build_change_map(
         class_config, persistence_periods=persistence_periods,
     )
     corroborated = compute_corroborated_change(
-        raw.changed, from_month, to_month, ccdc_result, bfast_result, corroboration_window_days
+        raw.changed, from_month, to_month, segments_result, corroboration_window_days
     )
 
     dnbr_band = dnbr if dnbr is not None else np.full(dst_shape, np.nan, dtype=np.float32)

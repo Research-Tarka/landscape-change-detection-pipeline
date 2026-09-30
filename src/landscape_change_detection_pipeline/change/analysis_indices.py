@@ -1,4 +1,4 @@
-"""Analysis-only spectral indices: Tasseled Cap and McFeeters' NDWI.
+"""Tasseled Cap and McFeeters' NDWI.
 
 Purpose
 -------
@@ -8,15 +8,14 @@ chromaticity for the land-cover *model*. Two more indices are useful for
 change-detection *analysis* specifically, but deliberately never added to
 that module or fed to the model:
 
-- **Tasseled Cap (Brightness/Greenness/Wetness)**: a fixed linear
-  combination of all six reflective bands. A CNN/random-forest model can
-  already learn any linear combination of its own raw-band inputs during
-  training, so adding TC as a model feature contributes no information the
-  model could not already discover itself -- it would only add three more
-  channels' worth of compute for zero accuracy gain. As a human-facing change
-  layer, though, TC Wetness/Greenness trajectories are a standard, directly
-  interpretable regrowth/moisture signal worth computing on demand for
-  analysis, not on every training/inference pass.
+- **Tasseled Cap (Brightness/Greenness/Wetness)**: a fixed, per-sensor
+  linear combination of all six reflective bands. Also usable as a model
+  feature (``TC_*`` names in ``features.index_names``, computed by
+  :func:`features.spectral_indices.compute_indices_dict`): the network could
+  learn such a combination itself, but it is a cheap, physically meaningful
+  prior (brightness for sand/bare/snow, wetness for water/wetland). As a
+  human-facing change layer, TC trajectories are a standard regrowth/moisture
+  signal.
 - **NDWI (McFeeters 1996)**: ``(green - nir) / (green + nir)``, the classic
   *open-water* index for tracking wetland/water-body change over time.
   Distinct from the already-modelled ``NDWI_GAO`` (Gao

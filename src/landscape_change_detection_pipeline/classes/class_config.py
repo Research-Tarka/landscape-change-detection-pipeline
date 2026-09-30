@@ -29,7 +29,7 @@ import json
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Mapping, Optional, Sequence
 
 import numpy as np
 import yaml
@@ -131,6 +131,54 @@ class ClassConfig:
         for raw_id, dense_id in raw_to_dense.items():
             out[labels == raw_id] = dense_id
         return out
+
+    def remap_dense_to_raw(self, labels: np.ndarray, nodata_value: int = 255) -> np.ndarray:
+        """Vectorized :meth:`dense_to_raw` over a whole label array -- the
+        inverse of :meth:`remap_raw_to_dense`, used at the boundary where a
+        model's dense-id prediction raster (e.g. an inference script's
+        ``class_map``) is written out for consumption by raw-id-only tools
+        (a painted mask, MaskForge). Any value not a known dense id
+        (including an existing ``nodata_value`` sentinel) maps to
+        ``nodata_value`` in the output.
+        """
+        dense_to_raw = self._dense_to_raw_map
+        out = np.full(labels.shape, nodata_value, dtype=np.uint8)
+        for dense_id, raw_id in dense_to_raw.items():
+            out[labels == dense_id] = raw_id
+        return out
+
+
+def label_remap_table(
+    class_names: Sequence[str], merge: Optional[Mapping[str, str]], nodata_value: int = 255
+) -> Optional[tuple[int, ...]]:
+    """256-entry lookup table over **dense** ids merging ``{source: target}``
+    class names (``training.class_merge``); ``None`` when ``merge`` is empty.
+
+    Dense id == position in ``class_names``. Every other id (including
+    ``nodata_value``) maps to itself. A merge must not chain (a target may not
+    itself be a source) and must name classes that exist in ``classes.yaml``.
+    """
+    if not merge:
+        return None
+    index = {name: i for i, name in enumerate(class_names)}
+    for source, target in merge.items():
+        for name in (source, target):
+            if name not in index:
+                raise ClassConfigError(
+                    f"class_merge names unknown class {name!r}; known classes: {sorted(index)}"
+                )
+        if source == target:
+            raise ClassConfigError(f"class_merge maps {source!r} onto itself")
+        if target in merge:
+            raise ClassConfigError(
+                f"class_merge chains {source!r} -> {target!r} -> {merge[target]!r}; map each source "
+                f"directly to its final class"
+            )
+    table = list(range(256))
+    for source, target in merge.items():
+        table[index[source]] = index[target]
+    table[nodata_value] = nodata_value
+    return tuple(table)
 
 
 def load_class_config(path: Optional[str] = None) -> ClassConfig:

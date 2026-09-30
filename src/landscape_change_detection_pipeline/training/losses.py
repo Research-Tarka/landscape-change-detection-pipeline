@@ -37,6 +37,7 @@ __all__ = [
     "ConfusionPenalty",
     "directional_penalty",
     "weighted_cross_entropy",
+    "soft_dice_loss",
     "compute_class_weights",
     "total_penalty",
     "downsample_labels",
@@ -111,7 +112,13 @@ def directional_penalty(
     valid = targets != ignore_index
     mask = valid & (targets != predicted_class) if true_class is None else valid & (targets == true_class)
     if not torch.any(mask):
-        return logits.new_zeros(())
+        # A graph-connected zero (not `logits.new_zeros(())`, a detached
+        # constant): a batch can be legitimately all-ignore_index (e.g. a
+        # small/edge scene under `split_by='scene'`), and this term must not
+        # break `loss.backward()` when it is the only loss term active that
+        # step, which a detached constant would (no grad_fn to backprop
+        # through).
+        return (logits.sum() * 0.0).to(logits.dtype)
 
     if probs is None:
         probs = torch.softmax(logits, dim=1)
@@ -121,19 +128,29 @@ def directional_penalty(
 def compute_class_weights(
     class_counts: Mapping[int, int],
     num_classes: int,
+    power: float = 1.0,
+    max_weight: Optional[float] = None,
 ) -> list[float]:
-    """Inverse-frequency class weights, `w_k = N_total / (num_classes * N_k)`.
+    """Inverse-frequency class weights, `w_k = (N_total / (num_classes * N_k)) ** power`.
 
-    A class with an exactly average share gets weight 1. Absent classes are
+    `power=1` is plain inverse frequency; `power=0.5` is the gentler
+    square-root variant, and `power=0` disables weighting. Plain inverse
+    frequency can reach weights in the hundreds for a very rare class, which
+    destabilises training; `power < 1` and/or `max_weight` (a hard cap applied
+    before renormalising) tame that. Weights are finally renormalised so their
+    pixel-weighted mean is 1, keeping the loss magnitude (and so the learning
+    rate) comparable whatever `power`/`max_weight` are. Absent classes are
     floored at a count of 1 rather than producing an infinite weight.
     """
-    total = sum(int(class_counts.get(k, 0)) for k in range(num_classes))
+    counts = [int(class_counts.get(k, 0)) for k in range(num_classes)]
+    total = sum(counts)
     if total <= 0:
         return [1.0] * num_classes
-    return [
-        total / max(1, num_classes * int(class_counts.get(k, 0)))
-        for k in range(num_classes)
-    ]
+    weights = [(total / max(1, num_classes * c)) ** power for c in counts]
+    if max_weight is not None:
+        weights = [min(w, float(max_weight)) for w in weights]
+    scale = total / max(1e-12, sum(c * w for c, w in zip(counts, weights)))
+    return [w * scale for w in weights]
 
 
 def weighted_cross_entropy(
@@ -141,18 +158,38 @@ def weighted_cross_entropy(
     targets: torch.Tensor,
     weight: Optional[torch.Tensor] = None,
     ignore_index: int = IGNORE_INDEX,
+    sample_weight: Optional[torch.Tensor] = None,
+    focal_gamma: float = 0.0,
 ) -> torch.Tensor:
     """Class-weighted cross-entropy, averaged over valid pixels only.
+
+    ``focal_gamma > 0`` turns it into a focal loss: each pixel's loss is
+    scaled by ``(1 - p_true) ** gamma``, so easy, already-well-classified
+    pixels (mostly the dominant classes) contribute little and the gradient
+    concentrates on hard pixels -- typically the rare classes. ``0`` is plain
+    cross-entropy; ``2`` is the usual focal-loss value.
 
     `reduction="mean"` with a `weight` normalises by the sum of weights
     rather than the pixel count, which makes the loss magnitude depend on
     the class mix of each batch. Reducing manually over the valid mask keeps
     the scale comparable from batch to batch, and returns a clean zero for
     an all-no-data batch instead of a NaN.
+
+    ``sample_weight``, when given, is a ``(N,)`` per-*item* (not per-pixel)
+    scalar multiplying every pixel of that batch item's loss before the
+    mean -- used to down-weight pseudo-labeled patches relative to real
+    annotations (see
+    :class:`landscape_change_detection_pipeline.config.PseudoLabelConfig`) without
+    changing which pixels are excluded or how class weighting is applied.
+    A batch of all-1.0 sample weights reproduces the unweighted mean exactly.
     """
     valid = targets != ignore_index
     if not torch.any(valid):
-        return logits.new_zeros(())
+        # Graph-connected zero, not a detached constant -- see the matching
+        # comment in `directional_penalty`: an all-ignore_index batch is
+        # legitimate (small/edge scene under `split_by='scene'`) and must
+        # not break `loss.backward()`.
+        return (logits.sum() * 0.0).to(logits.dtype)
 
     per_pixel = F.cross_entropy(
         logits,
@@ -161,7 +198,46 @@ def weighted_cross_entropy(
         ignore_index=ignore_index,
         reduction="none",
     )
+    if focal_gamma > 0.0:
+        plain_ce = F.cross_entropy(logits, targets, ignore_index=ignore_index, reduction="none")
+        per_pixel = per_pixel * (1.0 - torch.exp(-plain_ce)).clamp(min=0.0).pow(focal_gamma)
+    if sample_weight is not None:
+        per_pixel = per_pixel * sample_weight.to(per_pixel.dtype).view(-1, 1, 1)
     return per_pixel[valid].mean()
+
+
+def soft_dice_loss(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    ignore_index: int = IGNORE_INDEX,
+    smooth: float = 1.0,
+) -> torch.Tensor:
+    """Multi-class soft Dice loss, `1 - mean_k Dice_k`.
+
+    Dice is computed per class over the whole batch and averaged over the
+    classes actually present in the batch's labels, so every class counts
+    equally regardless of how many pixels it covers -- which is exactly why
+    it helps rare classes (cross-entropy is dominated by the big ones).
+    Meant to be added to cross-entropy, not to replace it.
+    """
+    valid = targets != ignore_index
+    if not torch.any(valid):
+        return (logits.sum() * 0.0).to(logits.dtype)
+
+    num_classes = logits.shape[1]
+    probs = torch.softmax(logits, dim=1)
+    safe = torch.where(valid, targets, torch.zeros_like(targets)).long()
+    one_hot = F.one_hot(safe, num_classes).permute(0, 3, 1, 2).to(probs.dtype)
+    mask = valid.unsqueeze(1).to(probs.dtype)
+    probs = probs * mask
+    one_hot = one_hot * mask
+
+    dims = (0, 2, 3)
+    intersection = (probs * one_hot).sum(dims)
+    cardinality = probs.sum(dims) + one_hot.sum(dims)
+    dice = (2.0 * intersection + smooth) / (cardinality + smooth)
+    present = one_hot.sum(dims) > 0
+    return 1.0 - dice[present].mean()
 
 
 def total_penalty(

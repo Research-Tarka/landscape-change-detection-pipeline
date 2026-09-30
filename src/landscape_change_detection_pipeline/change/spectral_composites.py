@@ -1,19 +1,28 @@
-"""Monthly per-tile spectral-index composites, for change-detection analysis.
+"""Per-scene/per-month spectral-index computation, for change-detection analysis.
 
 Purpose
 -------
 :mod:`landscape_change_detection_pipeline.inference.composites` (Stage 7) reduces
 per-scene *classification* rasters to one categorical class map per
 tile-month. NDVI regrowth, dNBR burn severity, and the other index-based
-change layers the roadmap calls for ("Then: change-detection layers") need
-the underlying *continuous reflectance*, not the classes derived from it --
-that information no longer exists once Stage 7 has voted it down to a single
-class id per pixel. This module re-reads the same raw per-scene reflectance
-Stage 7's classifier consumed (``data/tiles/<tile_id>.zarr/<sensor>/toa``),
-computes every spectral index of interest per scene, and reduces each index
-to one tile-month composite -- the same tile/month granularity as Stage 7,
-built in parallel from a different source, never derived from Stage 7's own
-output.
+change layers need the underlying *continuous reflectance*, not the classes
+derived from it -- that information no longer exists once Stage 7 has voted
+it down to a single class id per pixel. This module re-reads the same raw
+per-scene reflectance Stage 7's classifier consumed
+(``data/tiles/<tile_id>.zarr/<sensor>/toa``), computes every spectral index
+of interest per scene, and reduces each index to one tile-month composite --
+the same tile/month granularity as Stage 7, built in parallel from a
+different source, never derived from Stage 7's own output.
+
+This module provides the computation only -- it does not persist a
+per-tile-month store on disk. An earlier revision did (one ``indices.npz``
+per tile-month, every index x 4 statistics, unconditionally); at real-AOI
+scale that reached hundreds of GB for a superset the only real consumer
+(:mod:`change.regrowth_severity`) never read more than two indices of.
+Callers that need a month's composite now call :func:`compute_scene_indices`
++ :func:`build_month_index_composite` directly, on demand (see
+``change.regrowth_severity.build_month_composite_cache`` for the standard
+memoizing wrapper).
 
 Cloud/shadow exclusion
 ------------------------
@@ -49,14 +58,11 @@ that month's valid (non-cloud/shadow) scene observations:
   contributed to this pixel this month, so a median/min/max resting on a
   single scene can be told apart from one resting on a dozen.
 
-This is deliberately a superset of what any one index actually needs (dNBR
-only reads ``min``, NDVI regrowth mainly reads ``median``/``max``) so the
-same monthly cache also supports later seasonal/annual re-aggregation
-without recomputing from raw scenes again -- annual or seasonal statistics
-can be derived from these monthly per-pixel stats directly (e.g. an annual
-median-of-medians, weighted by ``n_obs``), which is why all four are stored
-unconditionally rather than only the one field each Prompt-17 layer reads
-today.
+All four are computed unconditionally for whichever indices are requested
+(dNBR only reads NBR's ``median``, NDVI regrowth only reads NDVI's
+``median``) -- cheap since nothing is persisted, and keeps
+:func:`build_month_index_composite` usable as-is for any future caller that
+does need ``min``/``max``/``n_obs``.
 
 Indices computed
 -------------------
@@ -74,7 +80,7 @@ from pathlib import Path
 
 import numpy as np
 
-from landscape_change_detection_pipeline.change.analysis_indices import ndwi_mcfeeters, tasseled_cap
+from landscape_change_detection_pipeline.change.analysis_indices import tasseled_cap
 from landscape_change_detection_pipeline.classes.class_config import ClassConfig
 from landscape_change_detection_pipeline.features.spectral_indices import INDEX_NAMES, compute_indices_dict
 from landscape_change_detection_pipeline.features.training_cache import bands_for_scene, scene_year
@@ -85,7 +91,7 @@ from landscape_change_detection_pipeline.scenes.zarr_store import read_sensor_gr
 #: Every index this module computes per scene: the model's own eight
 #: band-pair/chromaticity indices, plus the three Tasseled Cap components and
 #: McFeeters' NDWI (analysis-only, see change/analysis_indices.py).
-ALL_INDEX_NAMES: tuple[str, ...] = (*INDEX_NAMES, "TC_BRIGHTNESS", "TC_GREENNESS", "TC_WETNESS", "NDWI_MCFEETERS")
+ALL_INDEX_NAMES: tuple[str, ...] = (*INDEX_NAMES, "TC_BRIGHTNESS", "TC_GREENNESS", "TC_WETNESS")
 
 _TC_LABELS = {"TC_BRIGHTNESS": "brightness", "TC_GREENNESS": "greenness", "TC_WETNESS": "wetness"}
 
@@ -105,6 +111,30 @@ class SceneIndices:
     valid_mask: np.ndarray  # (H, W) bool -- True where not cloud/shadow
     transform: tuple[float, ...]
     crs_wkt: str
+
+
+def indices_from_bands(
+    bands: dict[str, np.ndarray],
+    provenance: dict[str, str],
+    sensor: str,
+    index_names: tuple[str, ...] = ALL_INDEX_NAMES,
+) -> dict[str, np.ndarray]:
+    """Every requested index (of :data:`ALL_INDEX_NAMES`) computed from one
+    scene's reflectance bands (``{label: array}``, labels blue/green/red/nir/
+    swir1/swir2). Works on whole scenes or on any sub-window of one."""
+    indices: dict[str, np.ndarray] = {}
+    normalized_difference_and_chroma = {n for n in index_names if n in INDEX_NAMES}
+    if normalized_difference_and_chroma:
+        computed = compute_indices_dict(bands, provenance, names=tuple(normalized_difference_and_chroma))
+        for name, (array, _provenance) in computed.items():
+            indices[name] = array
+
+    tc_names = {n for n in index_names if n in _TC_LABELS}
+    if tc_names:
+        tc = tasseled_cap(bands, sensor.upper())
+        for name in tc_names:
+            indices[name] = tc[_TC_LABELS[name]]
+    return indices
 
 
 def compute_scene_indices(
@@ -138,21 +168,7 @@ def compute_scene_indices(
     change_eligible_ids = set(class_config.change_eligible_ids())
     valid_mask = np.isin(class_map, list(change_eligible_ids)) & (class_map != class_map_data["nodata"])
 
-    indices: dict[str, np.ndarray] = {}
-    normalized_difference_and_chroma = {n for n in index_names if n in INDEX_NAMES}
-    if normalized_difference_and_chroma:
-        computed = compute_indices_dict(bands, provenance, names=tuple(normalized_difference_and_chroma))
-        for name, (array, _provenance) in computed.items():
-            indices[name] = array
-
-    tc_names = {n for n in index_names if n in _TC_LABELS}
-    if tc_names:
-        tc = tasseled_cap(bands, sensor.upper())
-        for name in tc_names:
-            indices[name] = tc[_TC_LABELS[name]]
-
-    if "NDWI_MCFEETERS" in index_names:
-        indices["NDWI_MCFEETERS"] = ndwi_mcfeeters(bands["green"], bands["nir"])
+    indices = indices_from_bands(bands, provenance, sensor, index_names)
 
     year = scene_year(sensor.lower(), scene_id)
     month = scene_month(sensor.lower(), scene_id)
@@ -265,9 +281,14 @@ def build_month_index_composite(
     if not scenes:
         raise ValueError("build_month_index_composite requires at least one scene")
 
-    from landscape_change_detection_pipeline.inference.composites import SENSOR_RESOLUTION_M
-
-    reference = min(scenes, key=lambda s: SENSOR_RESOLUTION_M.get(s.sensor, float("inf")))
+    # Every sensor is fetched onto the unified 10 m grid pinned to the DEM, so
+    # this is normally a no-op tie -- but the reference is still picked by
+    # each scene's own actual pixel size (from its transform), not assumed,
+    # so a scene that is for any reason off the unified grid (stale data, a
+    # bug elsewhere) still can't silently become the reference grid over a
+    # genuinely finer one. Ties (the expected case) break on (sensor,
+    # scene_id) for determinism.
+    reference = min(scenes, key=lambda s: (abs(s.transform[0]), s.sensor, s.scene_id))
     dst_shape = next(iter(reference.indices.values())).shape
 
     aligned_per_index: dict[str, list[np.ndarray]] = {name: [] for name in index_names}
@@ -300,7 +321,7 @@ def build_month_index_composite(
         stats[name] = _reduce_index_stack(stack, valid_stack)
 
     sensors_present = sorted({s.sensor for s in scenes})
-    resolution_m = SENSOR_RESOLUTION_M.get(reference.sensor, float("nan"))
+    resolution_m = abs(reference.transform[0])
 
     return {
         "stats": stats,
@@ -357,23 +378,18 @@ def _reproject_bilinear(array, src_transform, src_crs_wkt, dst_transform, dst_cr
     return destination
 
 
-def index_composite_output_path(output_root: str | Path, tile_id: str, month: str) -> Path:
-    """``<output_root>/<tile_id>/<month>/indices.npz``."""
-    return Path(output_root) / tile_id / month / "indices.npz"
-
-
 def discover_periods_for_tile(
     composites_root: str | Path, tile_id: str, filename: str = "indices.npz"
 ) -> list[str]:
     """Every ``"{year:04d}-{month:02d}"`` period with a stored composite
     file for this one tile, sorted -- the single-tile analogue of
     ``mosaic.mosaic.discover_periods`` (which scans across every tile).
-    ``filename`` defaults to this module's own ``"indices.npz"`` (needed by
-    e.g. ``change.regrowth_severity``'s NDVI trajectory), but the same
-    ``<root>/<tile_id>/<period>/<filename>`` layout is shared by Stage 7's
-    plain classification composites (``"composite.npz"``), so
-    ``change.change_maps`` reuses this function for that directory too
-    rather than duplicating the same directory walk."""
+    ``filename`` defaults to ``"indices.npz"`` for historical reasons but is
+    always passed explicitly by every current caller -- both
+    ``change.change_maps`` and ``change.regrowth_severity`` use this to walk
+    Stage 7's plain classification composites (``"composite.npz"``), the
+    only per-tile-month directory layout still produced by this
+    pipeline."""
     tile_dir = Path(composites_root) / tile_id
     if not tile_dir.is_dir():
         return []
@@ -382,82 +398,3 @@ def discover_periods_for_tile(
     )
 
 
-def write_index_composite(path: str | Path, result: dict) -> Path:
-    """Write one tile-month's index statistics as an uncompressed ``.npz``.
-
-    Deliberately ``np.savez`` (uncompressed), not ``savez_compressed`` --
-    unlike the categorical, small-integer-alphabet class maps every other
-    ``.npz`` writer in this pipeline stores (which zlib compresses fast and
-    well), this payload is up to 15 indices x 4 float32 statistics of
-    continuous, high-entropy reflectance-derived values. Measured on real
-    pilot-tile data: zlib compression time dominated this module's entire
-    runtime (85s of a 107s full-tile build, ~80%) for an ~18% size reduction
-    -- a bad trade this module does not make.
-    """
-    out = Path(path)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "transform": np.array(list(result["transform"])[:6], dtype=np.float64),
-        "crs_wkt": np.array(result["crs_wkt"]),
-        "resolution_m": np.array(result["resolution_m"], dtype=np.float64),
-        "n_scenes": np.array(result["n_scenes"], dtype=np.int32),
-        "sensors_present": np.array(result["sensors_present"]),
-        "index_names": np.array(list(result["stats"].keys())),
-    }
-    for name, stats in result["stats"].items():
-        for stat_name, array in stats.items():
-            payload[f"{name}__{stat_name}"] = array
-    np.savez(out, **payload)
-    return out
-
-
-def read_index_composite(path: str | Path) -> dict:
-    with np.load(Path(path), allow_pickle=False) as data:
-        index_names = [str(n) for n in data["index_names"]]
-        stats: dict[str, dict[str, np.ndarray]] = {}
-        for name in index_names:
-            stats[name] = {stat: np.array(data[f"{name}__{stat}"]) for stat in STATS}
-        return {
-            "stats": stats,
-            "transform": tuple(float(v) for v in data["transform"]),
-            "crs_wkt": str(data["crs_wkt"]),
-            "resolution_m": float(data["resolution_m"]),
-            "n_scenes": int(data["n_scenes"]),
-            "sensors_present": [str(s) for s in data["sensors_present"]],
-        }
-
-
-def build_all_month_index_composites(
-    tile_dir: str | Path,
-    inference_root: str | Path,
-    output_root: str | Path,
-    tile_id: str,
-    class_config: ClassConfig,
-    index_names: tuple[str, ...] = ALL_INDEX_NAMES,
-    overwrite: bool = False,
-) -> list[Path]:
-    """Build every tile-month index composite available for one tile.
-    Scenes with no Stage 6 classification yet are skipped (a coverage gap,
-    not an error -- classification may simply not have reached that scene
-    yet). Returns the paths actually (re)written."""
-    written: list[Path] = []
-    scene_keys = discover_tile_scenes(tile_dir, tile_id)
-
-    scenes: list[SceneIndices] = []
-    for sensor, scene_id in scene_keys:
-        try:
-            scenes.append(
-                compute_scene_indices(tile_dir, inference_root, tile_id, sensor, scene_id, class_config, index_names)
-            )
-        except FileNotFoundError:
-            continue
-
-    groups = group_scenes_by_month(scenes)
-    for month in sorted(groups):
-        out_path = index_composite_output_path(output_root, tile_id, month)
-        if out_path.is_file() and not overwrite:
-            continue
-        result = build_month_index_composite(groups[month], index_names)
-        write_index_composite(out_path, result)
-        written.append(out_path)
-    return written

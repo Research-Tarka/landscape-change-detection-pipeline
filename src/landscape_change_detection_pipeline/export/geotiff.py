@@ -40,6 +40,14 @@ unambiguous, never a guess):
   ``(H, W)`` dNBR grid and its validity mask (the file's other keys,
   ``trajectory_*``, are a sparse per-(pixel, month) table, not a grid, and
   are never part of a GeoTIFF export).
+- **Generic dense grids** (``change_events``, ``snow_water_dynamics``,
+  ``segments`` maps, and everything written by ``scripts/14``: vegetation
+  dynamics, recovery analysis, monthly anomalies): every 2-D array on the
+  file's grid is a band, every 3-D array a band per slice
+  (``<key>__<year|water year|month>``), each with its own dtype.
+- **Landcover persistence** (``change.landcover_persistence``): the
+  interval table summarised per tracked class (count, first start, last end,
+  still active).
 - **Sparse per-pixel table rasterised onto its own reference grid**
   (``change.bfast.write_bfast_result``): keys ``row`` + ``col`` + ``shape``
   (the reference grid every ``(row, col)`` indexes into) + one or more
@@ -61,6 +69,7 @@ format.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 
@@ -313,10 +322,155 @@ def export_ccdc_result(data: dict) -> dict:
     }
 
 
+#: Keys that are georeferencing / labelling metadata, never a band.
+_META_KEYS = ("transform", "crs_wkt", "resolution_m", "shape", "nodata", "product", "year0")
+
+
+def _axis_labels(data: dict, key: str, n: int) -> list[str]:
+    """Band labels for the leading axis of a 3-D array: ``labels__<key>`` if
+    stored, else a ``water_years`` / ``years`` array of matching length, else
+    the positional index."""
+    for candidate in (f"labels__{key}", "water_years", "years"):
+        labels = data.get(candidate)
+        if labels is not None and np.ndim(labels) == 1 and len(labels) == n:
+            return [str(v) for v in labels]
+    return [str(i) for i in range(n)]
+
+
+def _band_spec_for(array: np.ndarray) -> tuple[np.ndarray, str, object]:
+    """``(array cast for GeoTIFF, dtype name, nodata)`` for one band."""
+    kind = array.dtype.kind
+    if kind == "b":
+        return array.astype(np.uint8), "uint8", None
+    if kind == "f":
+        return array.astype(np.float32), "float32", np.nan
+    if kind == "u":
+        return (array, "uint8", None) if array.dtype.itemsize == 1 else (array.astype(np.int32), "int32", None)
+    if kind == "i":
+        if array.dtype.itemsize <= 2:
+            return array.astype(np.int16), "int16", None
+        return array.astype(np.int32), "int32", None
+    raise GeoTiffExportError(f"unsupported band dtype {array.dtype}")
+
+
+def _is_band_candidate(key: str, array: np.ndarray) -> bool:
+    return not (key in _META_KEYS or key.startswith(("tbl_", "labels__", "grid_meta")) or array.dtype.kind not in "biuf")
+
+
+def _grid_shape_of(data: dict) -> Optional[tuple[int, int]]:
+    """The raster grid a generic ``.npz`` lives on: the trailing ``(H, W)`` shared by the most
+    numeric 2-D / 3-D arrays (table columns, ``tbl_*`` and ``labels__*`` never count)."""
+    votes: dict[tuple[int, int], int] = {}
+    for key, array in data.items():
+        if not _is_band_candidate(key, array):
+            continue
+        if array.ndim in (2, 3) and min(array.shape[-2:]) >= 16:  # (N, n_features) tables are not grids
+            shape = tuple(int(v) for v in array.shape[-2:])
+            votes[shape] = votes.get(shape, 0) + (array.shape[0] if array.ndim == 3 else 1)
+    if not votes:
+        return None
+    if "shape" in data and tuple(int(v) for v in data["shape"]) in votes:
+        return tuple(int(v) for v in data["shape"])
+    return max(votes, key=votes.get)
+
+
+def export_generic_dense(data: dict) -> dict:
+    """Payload for any ``.npz`` that carries georeferencing plus dense grids: every
+    2-D array on the file's grid is a band, every 3-D array a band per slice named
+    ``<key>__<label>`` (year, water year, month ...). Each band keeps its own dtype (a
+    file mixing dtypes is written as one GeoTIFF per dtype). Sparse tables are not
+    part of it -- they are CSV exports."""
+    if "transform" not in data or "crs_wkt" not in data:
+        raise GeoTiffExportError("no 'transform'/'crs_wkt' in the file: not a georeferenced raster product")
+    grid = _grid_shape_of(data)
+    if grid is None:
+        raise GeoTiffExportError("no dense (H, W) grid found in the file (a sparse table? export it as CSV)")
+    bands: dict[str, np.ndarray] = {}
+    per_band_dtype: dict[str, str] = {}
+    per_band_nodata: dict[str, object] = {}
+    for key in sorted(data):
+        array = data[key]
+        if not _is_band_candidate(key, array):
+            continue
+        if array.ndim == 2 and tuple(array.shape) == grid:
+            slices = [(key, array)]
+        elif array.ndim == 3 and tuple(array.shape[1:]) == grid:
+            labels = _axis_labels(data, key, array.shape[0])
+            slices = [(f"{key}__{lab}", array[i]) for i, lab in enumerate(labels)]
+        else:
+            continue
+        for name, arr in slices:
+            cast, dtype, nodata = _band_spec_for(arr)
+            bands[name] = cast
+            per_band_dtype[name] = dtype
+            per_band_nodata[name] = nodata
+    if not bands:
+        raise GeoTiffExportError("no dense band found on the file's grid")
+    return {
+        "bands": bands,
+        "transform": tuple(float(v) for v in data["transform"]),
+        "crs_wkt": str(data["crs_wkt"]),
+        "per_band_dtype": per_band_dtype,
+        "per_band_nodata": per_band_nodata,
+        "resampling": "nearest",
+    }
+
+
+def _month_code(values: np.ndarray) -> np.ndarray:
+    """``"YYYY-MM"`` strings -> ``YYYYMM`` ints (0 for empty)."""
+    out = np.zeros(len(values), dtype=np.int32)
+    for i, v in enumerate(values):
+        v = str(v)
+        if len(v) >= 7:
+            out[i] = int(v[:4]) * 100 + int(v[5:7])
+    return out
+
+
+def export_landcover_persistence(data: dict) -> dict:
+    """Dense summary of ``landcover_persistence.npz``'s interval table: per tracked class,
+    the number of intervals, the first start and last end (``YYYYMM``; 0 = none / still
+    active) and whether the class is still active at the end of the series."""
+    height, width = (int(v) for v in data["shape"])
+    rows, cols = data["row"], data["col"]
+    names = np.array([str(v) for v in data["class_name"]])
+    start, end = _month_code(data["start_month"]), _month_code(data["end_month"])
+    bands, dtypes, nodata = {}, {}, {}
+
+    def put(key, grid, dtype, nd):
+        bands[key], dtypes[key], nodata[key] = grid, dtype, nd
+
+    for cls in sorted(set(names.tolist())):
+        sel = names == cls
+        r, c, st, en = rows[sel], cols[sel], start[sel], end[sel]
+        n_int = np.zeros((height, width), dtype=np.uint8)
+        np.add.at(n_int, (r, c), 1)
+        first = np.full((height, width), 999999, dtype=np.int32)
+        np.minimum.at(first, (r, c), st)
+        first[first == 999999] = 0
+        last = np.zeros((height, width), dtype=np.int32)
+        np.maximum.at(last, (r, c), en)
+        active = np.zeros((height, width), dtype=np.uint8)
+        active[r[en == 0], c[en == 0]] = 1
+        put(f"{cls}__n_intervals", n_int, "uint8", None)
+        put(f"{cls}__first_start_yyyymm", first, "int32", None)
+        put(f"{cls}__last_end_yyyymm", last, "int32", None)
+        put(f"{cls}__still_active", active, "uint8", None)
+    return {
+        "bands": bands, "transform": tuple(float(v) for v in data["transform"]), "crs_wkt": str(data["crs_wkt"]),
+        "per_band_dtype": dtypes, "per_band_nodata": nodata, "resampling": "nearest",
+    }
+
+
 def build_export_payload(npz_path: str | Path) -> dict:
     """Load an ``.npz`` file and return its GeoTIFF-write payload, detecting
     which of this pipeline's stored formats it is."""
     data = _load_npz(npz_path)
+
+    if "product" in data or "latest_event_type" in data:  # scripts/14 products, change events (row/col/break_date look like bfast)
+        return export_generic_dense(data)
+
+    if "class_name" in data and "start_month" in data and "end_month" in data and "shape" in data:
+        return export_landcover_persistence(data)
 
     if "from_class" in data:
         return export_named_multiband(data, CHANGE_MAP_KEYS, _CHANGE_MAP_BAND_SPEC)
@@ -327,7 +481,7 @@ def build_export_payload(npz_path: str | Path) -> dict:
         # (multi-segment-per-pixel) table, not bfast's one-row-per-pixel one.
         return export_ccdc_result(data)
 
-    if "row" in data and "col" in data and "shape" in data:
+    if "row" in data and "col" in data and "shape" in data and any(k in data for k in BFAST_VALUE_KEYS):
         return export_bfast_result(data)
 
     if "dnbr" in data and "has_dnbr" in data:
@@ -339,6 +493,11 @@ def build_export_payload(npz_path: str | Path) -> dict:
     for key in SINGLE_BAND_KEYS:
         if key in data:
             return export_single_band(data, key)
+
+    try:  # change events, snow/water dynamics, segments ...: any georeferenced file with dense grids
+        return export_generic_dense(data)
+    except GeoTiffExportError:
+        pass
 
     raise GeoTiffExportError(
         f"'{npz_path}' does not match any recognised format (expected one of "
