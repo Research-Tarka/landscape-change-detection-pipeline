@@ -67,6 +67,7 @@ dem:
   tile_dir: data/tiles                 # holds <tile_id>.zarr, one per tile
   use_copernicus_fallback: true        # fall back to Copernicus GLO-30 if MRDEM-30 has no coverage
   force_copernicus: false              # debug/test switch: skip MRDEM entirely
+  target_resolution_m: 10.0            # reference grid resolution every array is reprojected onto
 
 # ----------------------------------------------------------------------
 # GEE scene search/download
@@ -97,6 +98,41 @@ scene_download:
 # ----------------------------------------------------------------------
 topographic_correction:
   enabled: false
+  method: scs_c                        # only scs_c (Sun-Canopy-Sensor + C) is implemented
+  min_sun_elevation_deg: 5.0           # skip correction for a scene with sun lower than this
+  reference_band: nir                  # band the scene-wide C parameter is fit on, reused for every band
+  ratio_clip_min: 0.2                  # bounds on the per-pixel correction ratio
+  ratio_clip_max: 5.0
+
+# ----------------------------------------------------------------------
+# Cross-sensor bandpass adjustment (Landsat -> Sentinel-2, y = scale*x + offset).
+# Disabled: published coefficients are SR-derived, the pipeline runs on TOA.
+# Default coefficients = Claverie et al. 2018 (same table for L5/L7/L8/L9).
+# ----------------------------------------------------------------------
+harmonization:
+  enabled: false
+  coefficients:
+    L8: &bandpass
+      blue:  {scale: 1.022704, offset: 0.004091}
+      green: {scale: 0.994728, offset: 0.000895}
+      red:   {scale: 1.024066, offset: -0.000922}
+      nir:   {scale: 1.001703, offset: 0.000100}
+      swir1: {scale: 1.001302, offset: 0.001101}
+      swir2: {scale: 0.997009, offset: 0.001196}
+    L5: *bandpass
+    L7: *bandpass
+    L9: *bandpass
+
+# ----------------------------------------------------------------------
+# RGB visualization composites (QA/annotation only, never fed to the model).
+# ----------------------------------------------------------------------
+rgb_composites:
+  true_color_enabled: true
+  true_color_shadow_enabled: true
+  natural_color_enabled: false         # SWIR2/NIR/red -- off until visually validated
+  color_infrared_enabled: false        # NIR/red/green -- off until visually validated
+  asinh_k: 8.0
+  gamma: 0.4545454545454545            # 1/2.2 -- raise (e.g. 0.35) for a brighter shadow view
 
 # ----------------------------------------------------------------------
 # Spectral indices and annotation-to-training-cache export
@@ -269,6 +305,7 @@ model:
     norm_type: batch                    # batch | group -- group is incompatible with multi-sensor training
     bottleneck_attention: false         # self-attention over the bottleneck grid
     bottleneck_attention_heads: 8       # only read when bottleneck_attention is true
+    num_sensors: 1                      # >1 adds per-sensor handling (not compatible with norm_type=group)
     deep_supervision: false             # auxiliary decoder-level logit heads, training-time only
 
   # -- type: deeplabv3plus -----------------------------------------------------
@@ -292,6 +329,7 @@ model:
 training:
   epochs: 100
   batch_size: 32
+  micro_batch_size: null                # e.g. 8: grads accumulated over batch_size (same step), activations only for 8 -> much less VRAM; null = off
   patch_size: 256                       # must be <= the smallest tile's grid size for that sensor, or scenes get reflect-padded up to it
   lr: 0.0003
   weight_decay: 0.0001
@@ -511,6 +549,7 @@ change_detection:
   max_harmonics: 3                       # 1-3, seasonal model complexity (grows with segment length automatically, capped here)
   outlier_p: 0.999999                    # probability level above which an isolated init-window observation is dropped
   max_segments: 16                       # cap on segments per pixel
+  use_slope_interaction: false           # per-sensor offset scaled by DEM slope (extra model column per non-reference sensor)
   min_magnitude: 0.1                     # keep a confirmed break only if the shift reaches this on one of magnitude_features (0 = off)
   magnitude_features: [NBR, NDVI]
   min_break_span_days: 45                # confirming run must also span this many days (0 = off)

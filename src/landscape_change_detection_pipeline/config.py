@@ -914,6 +914,10 @@ class TrainingConfig(BaseModel):
 
     epochs: int = 100
     batch_size: int = 32
+    #: Forward/backward on chunks of this many samples, gradients accumulated
+    #: over the whole ``batch_size`` -- same optimisation step, far less VRAM
+    #: (activations dominate). null = whole batch at once.
+    micro_batch_size: Optional[int] = None
     patch_size: int = 256
     lr: float = 3e-4
     weight_decay: float = 1e-4

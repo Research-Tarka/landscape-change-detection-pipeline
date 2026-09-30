@@ -21,7 +21,11 @@ Usage
 from __future__ import annotations
 
 import argparse
+import os
 import sys
+
+# Must be set before torch initialises CUDA: avoids allocator fragmentation (VRAM creep).
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 from pathlib import Path
 
 import numpy as np

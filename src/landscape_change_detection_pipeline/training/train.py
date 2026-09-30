@@ -900,23 +900,32 @@ def train_model(
 
             optimizer.zero_grad(set_to_none=True)
 
-            with autocast(device_type=resolved_device.type, enabled=use_amp):
-                output = model(x, return_aux=True) if supports_deep_supervision else model(x)
-                logits, aux_logits = output if supports_deep_supervision else (output, [])
+            micro = config.micro_batch_size
+            chunk_ids = range(0, x.size(0), micro) if micro and micro < x.size(0) else [0]
+            step = micro if micro and micro < x.size(0) else x.size(0)
+            loss_total = 0.0
+            for start in chunk_ids:
+                xc, yc, wc = x[start:start + step], y[start:start + step], sample_weight[start:start + step]
+                frac = xc.size(0) / x.size(0)
+                with autocast(device_type=resolved_device.type, enabled=use_amp):
+                    output = model(xc, return_aux=True) if supports_deep_supervision else model(xc)
+                    logits, aux_logits = output if supports_deep_supervision else (output, [])
 
-                logits_f32 = logits.float()
-                loss = weighted_cross_entropy(
-                    logits_f32, y, class_weights, IGNORE_INDEX, sample_weight=sample_weight,
-                    focal_gamma=config.focal_gamma,
-                ) + total_penalty(logits_f32, y, penalties, IGNORE_INDEX)
-                if config.dice_weight > 0.0:
-                    loss = loss + config.dice_weight * soft_dice_loss(logits_f32, y, IGNORE_INDEX)
-                if aux_logits:
-                    loss = loss + deep_supervision_loss(
-                        [t.float() for t in aux_logits], y, class_weights, ignore_index=IGNORE_INDEX
-                    )
+                    logits_f32 = logits.float()
+                    loss = weighted_cross_entropy(
+                        logits_f32, yc, class_weights, IGNORE_INDEX, sample_weight=wc,
+                        focal_gamma=config.focal_gamma,
+                    ) + total_penalty(logits_f32, yc, penalties, IGNORE_INDEX)
+                    if config.dice_weight > 0.0:
+                        loss = loss + config.dice_weight * soft_dice_loss(logits_f32, yc, IGNORE_INDEX)
+                    if aux_logits:
+                        loss = loss + deep_supervision_loss(
+                            [t.float() for t in aux_logits], yc, class_weights, ignore_index=IGNORE_INDEX
+                        )
+                scaler.scale(loss * frac).backward()
+                loss_total += float(loss.item()) * frac
+            loss = torch.tensor(loss_total)
 
-            scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.grad_clip_norm)
             scaler.step(optimizer)
