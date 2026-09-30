@@ -103,8 +103,6 @@ topographic_correction:
 # ----------------------------------------------------------------------
 features:
   train_root: data/train_cache          # one .npz/.json cache pair per annotated scene
-  # scripts/convert_cache_to_memmap.py: parallel processes (each holds one scene in RAM).
-  convert_workers: 4
   mask_root: data/masks                 # MaskForge's SaveConfig.output_root -- {tile_id}_{sensor}_{scene_id}/mask.tif
   # Where scripts/export_georeferenced_cache.py writes standalone georeferenced
   # GeoTIFFs (features.tif + labels.tif per scene) reconstructed from train_root.
@@ -112,6 +110,7 @@ features:
   # to open a scene+mask in QGIS for a visual check -- no knowledge of this
   # pipeline needed to use it.
   geotiff_export_root: data/train_geotiff
+  pseudo_geotiff_export_root: data/pseudo_label_geotiff
 
   # Spectral input variables, in model-input order. Active = plain line,
   # available-but-off = commented with #. Changing this changes the model's

@@ -28,7 +28,9 @@ Usage
     python scripts/export_georeferenced_cache.py --config configs/config.yaml --out-dir some/other/folder
 
 Writes to ``config.features.geotiff_export_root`` by default (override with
-``--out-dir``).
+``--out-dir``). Pseudo-labeled scenes (``training.pseudo_label.pseudo_label_root``,
+if it exists) go to a separate folder,
+``config.features.pseudo_geotiff_export_root`` (override with ``--pseudo-out-dir``).
 
 To inspect a cache someone else sent you without merging it into your own
 ``data/train_cache/`` first, point ``--config`` at a config whose
@@ -61,6 +63,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Directory to write <tile_id>/<sensor>/<scene_id>/{features,labels}.tif into "
         "(default: config.features.geotiff_export_root)",
     )
+    parser.add_argument(
+        "--pseudo-out-dir",
+        default=None,
+        help="Directory for the pseudo-label scenes (default: config.features.pseudo_geotiff_export_root)",
+    )
+    parser.add_argument("--workers", type=int, default=4, help="Scenes written concurrently (default: 4)")
     return parser.parse_args(argv)
 
 
@@ -70,8 +78,17 @@ def main(argv: list[str] | None = None) -> int:
     out_dir = args.out_dir or config.features.geotiff_export_root
 
     print(f"[geotiff-export] reading cache from {config.features.train_root}")
-    written = export_train_root_as_geotiff(config.features.train_root, out_dir)
+    written = export_train_root_as_geotiff(config.features.train_root, out_dir, args.workers)
     print(f"[geotiff-export] wrote {len(written)} scenes to {out_dir}")
+
+    pseudo_root = config.training.pseudo_label.pseudo_label_root
+    if Path(pseudo_root).is_dir():
+        pseudo_out = args.pseudo_out_dir or config.features.pseudo_geotiff_export_root
+        print(f"[geotiff-export] reading pseudo-labels from {pseudo_root}")
+        pseudo_written = export_train_root_as_geotiff(pseudo_root, pseudo_out, args.workers)
+        print(f"[geotiff-export] wrote {len(pseudo_written)} pseudo-label scenes to {pseudo_out}")
+    else:
+        print(f"[geotiff-export] no pseudo-label root at {pseudo_root}, skipped")
     return 0
 
 

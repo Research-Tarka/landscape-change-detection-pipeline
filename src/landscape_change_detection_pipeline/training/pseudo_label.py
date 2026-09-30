@@ -38,6 +38,7 @@ import numpy as np
 from landscape_change_detection_pipeline.features.training_cache import (
     CACHE_FILENAME,
     NODATA_LABEL,
+    upgrade_to_memmap,
     write_scene_cache,
 )
 
@@ -210,6 +211,7 @@ def generate_pseudo_labels(
             ],
         )
         if _pseudo_cache_is_current(cache_dir, signature):
+            upgrade_to_memmap(cache_dir)
             return "current", cache_dir, signature, None
         try:
             built = build_feature_stack(

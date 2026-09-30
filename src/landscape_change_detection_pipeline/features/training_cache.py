@@ -492,6 +492,27 @@ def cache_is_current(cache_dir: Path, expected_signature: str) -> bool:
     return meta.get("signature") == expected_signature
 
 
+def upgrade_to_memmap(cache_dir: Path) -> bool:
+    """Convert a legacy scene cache (arrays inside ``features.npz``) in place
+    to the memmap layout (``features.npy`` + ``labels.npy``, ``.npz`` left
+    with metadata only). The ``.json`` signature is untouched, so the cache
+    stays "current". Returns False when already converted."""
+    npz_path = cache_dir / CACHE_FILENAME
+    with np.load(npz_path, allow_pickle=False) as data:
+        if "features" not in data:
+            return False
+        features = data["features"]
+        labels = data["labels"]
+        meta = {k: data[k] for k in data.files if k not in ("features", "labels")}
+    np.save(cache_dir / FEATURES_NPY, features)
+    np.save(cache_dir / LABELS_NPY, labels)
+    del features, labels
+    tmp = cache_dir / "features.tmp.npz"
+    np.savez(tmp, **meta)
+    os.replace(tmp, npz_path)
+    return True
+
+
 def write_scene_cache(
     cache_dir: Path,
     features: np.ndarray,
@@ -625,6 +646,7 @@ def export_annotated_scene(
     signature = scene_cache_signature(scene.scene_key, source_paths, feature_names)
 
     if cache_is_current(cache_dir, signature):
+        upgrade_to_memmap(cache_dir)
         return None
 
     features, feature_names, _provenance, transform, crs_wkt = build_feature_stack(
@@ -716,75 +738,82 @@ def export_cache_scene_as_geotiff(
     """
     import rasterio
     from rasterio.crs import CRS
+    from rasterio.windows import Window
 
-    cache = load_scene_cache(Path(cache_dir))
+    cache_dir = Path(cache_dir)
+    scene_out_dir = Path(out_dir) / tile_id / sensor / scene_id
+    features_path = scene_out_dir / "features.tif"
+    labels_path = scene_out_dir / "labels.tif"
+
+    # Skip scenes whose GeoTIFFs are already newer than every cache file.
+    if features_path.exists() and labels_path.exists():
+        newest_src = max(p.stat().st_mtime_ns for p in cache_dir.iterdir() if p.is_file())
+        if min(features_path.stat().st_mtime_ns, labels_path.stat().st_mtime_ns) >= newest_src:
+            return features_path, labels_path
+
+    # mmap: pages are read strip by strip below, so the float32 upcast never
+    # materialises the whole scene (legacy .npz caches are loaded fully).
+    cache = load_scene_cache(cache_dir, mmap=True)
     if not cache["crs_wkt"]:
         raise ValueError(
             f"Cache at '{cache_dir}' has no stored georeferencing (built before this feature "
             f"was added) -- re-run scripts/04_export_training_cache.py to rebuild it."
         )
 
-    scene_out_dir = Path(out_dir) / tile_id / sensor / scene_id
     scene_out_dir.mkdir(parents=True, exist_ok=True)
-    #: GDAL has no float16 dtype -- the cache stores features that way to
-    #: keep .npz files small, but a GeoTIFF needs a GDAL-supported dtype.
-    features = cache["features"].astype(np.float32)
-    labels = cache["labels"]
+    features, labels = cache["features"], cache["labels"]
     transform = list_to_transform(cache["transform"])
     crs = CRS.from_user_input(cache["crs_wkt"])
+    n_bands, height, width = features.shape
+    #: GDAL has no float16 dtype -- upcast per strip. Tiled + floating-point
+    #: predictor compresses the float data better and faster than plain deflate.
+    profile = dict(
+        driver="GTiff", height=height, width=width, crs=crs, transform=transform,
+        compress="deflate", zlevel=1, tiled=True, blockxsize=256, blockysize=256,
+        num_threads="ALL_CPUS",
+    )
+    strip = 1024
 
-    features_path = scene_out_dir / "features.tif"
-    with rasterio.open(
-        features_path,
-        "w",
-        driver="GTiff",
-        height=features.shape[1],
-        width=features.shape[2],
-        count=features.shape[0],
-        dtype=features.dtype,
-        crs=crs,
-        transform=transform,
-        compress="deflate",
-    ) as dst:
-        dst.write(features)
+    with rasterio.open(features_path, "w", count=n_bands, dtype="float32", predictor=3, **profile) as dst:
+        for row in range(0, height, strip):
+            win = Window(0, row, width, min(strip, height - row))
+            dst.write(np.asarray(features[:, row : row + win.height, :], dtype=np.float32), window=win)
         for band_index, name in enumerate(cache["feature_names"], start=1):
             dst.set_band_description(band_index, name)
 
-    labels_path = scene_out_dir / "labels.tif"
-    with rasterio.open(
-        labels_path,
-        "w",
-        driver="GTiff",
-        height=labels.shape[0],
-        width=labels.shape[1],
-        count=1,
-        dtype=labels.dtype,
-        crs=crs,
-        transform=transform,
-        compress="deflate",
-    ) as dst:
-        dst.write(labels, 1)
+    with rasterio.open(labels_path, "w", count=1, dtype=str(labels.dtype), predictor=2, **profile) as dst:
+        for row in range(0, height, strip):
+            win = Window(0, row, width, min(strip, height - row))
+            dst.write(np.asarray(labels[row : row + win.height, :]), 1, window=win)
         dst.set_band_description(1, "class_id")
 
     return features_path, labels_path
 
 
-def export_train_root_as_geotiff(train_root: str | Path, out_dir: str | Path) -> list[tuple[Path, Path]]:
+def export_train_root_as_geotiff(
+    train_root: str | Path, out_dir: str | Path, workers: int = 4
+) -> list[tuple[Path, Path]]:
     """Export every scene cached under ``train_root`` to standalone
     georeferenced GeoTIFFs under ``out_dir`` (see
     :func:`export_cache_scene_as_geotiff`), in sorted ``(tile_id, sensor,
     scene_id)`` order. Scenes whose cache predates georeferencing are
-    skipped with a printed warning rather than failing the whole export."""
+    skipped with a printed warning rather than failing the whole export.
+    Scenes already exported and newer than their cache are skipped; ``workers``
+    scenes are written concurrently."""
+    from concurrent.futures import ThreadPoolExecutor
+
     from landscape_change_detection_pipeline.training.dataset import discover_scene_records
 
-    written: list[tuple[Path, Path]] = []
-    for record in discover_scene_records(train_root):
+    def _one(record):
         try:
-            written.append(
-                export_cache_scene_as_geotiff(
-                    record.cache_dir, out_dir, record.tile_id, record.sensor, record.scene_id
-                )
+            return export_cache_scene_as_geotiff(
+                record.cache_dir, out_dir, record.tile_id, record.sensor, record.scene_id
             )
         except ValueError as exc:
             print(f"[geotiff-export] skipping {record.scene_key}: {exc}")
-    return written
+            return None
+
+    records = discover_scene_records(train_root)
+    # Threads: GDAL compression and file writes release the GIL.
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        return [r for r in pool.map(_one, records) if r is not None]

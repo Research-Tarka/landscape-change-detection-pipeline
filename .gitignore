@@ -53,3 +53,5 @@ configs/config_threshold.yaml
 configs/config_unet.yaml
 logs
 outputs_export/
+
+.streamlit/

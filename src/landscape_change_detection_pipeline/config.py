@@ -357,8 +357,7 @@ class FeaturesConfig(BaseModel):
     train_root: str = "data/train_cache"
     mask_root: str = "data/masks"
     geotiff_export_root: str = "data/train_geotiff"
-    #: Parallel processes used by scripts/convert_cache_to_memmap.py (one scene in RAM each).
-    convert_workers: int = 4
+    pseudo_geotiff_export_root: str = "data/pseudo_label_geotiff"
     index_names: Optional[list[str]] = None
     dem_layer_names: Optional[list[str]] = None
     include_doy_features: bool = True
