@@ -32,37 +32,43 @@ from typing import Optional
 import numpy as np
 
 #: Fixed class-priority fallback for the ambiguity tie-break, most-important
-#: first. Water/wetland (open_water, ice_cover, wetland_marsh) lead: they are
-#: land-cover features most consequential to miss and are the pair
-#: most easily confused with shadow/dark-canopy classes. Disturbance classes
-#: (cutblock_harvest, burned_disturbed, bare_ground,
-#: built_up_infrastructure) follow: under- or over-mapping human/fire disturbance
-#: directly skews downstream change-detection reads. Snow, rock/alpine, and alpine
-#: tundra come next (unambiguous but high-elevation/seasonal context worth
-#: resolving deterministically), then the vegetation classes in order of
-#: successional/structural distinctiveness, and finally the two
-#: imaging-artifact classes (cloud, shadow) -- see class_config.ClassDef.change_eligible
-#: for why these two are excluded from land-cover comparisons entirely; here
-#: they are ranked last so a real land-cover class always wins a close tie
-#: against them.
-DEFAULT_CLASS_PRIORITY_ORDER: tuple[int, ...] = (
-    5,   # open_water
-    9,   # ice_cover
-    4,   # wetland_marsh
-    6,   # cutblock_harvest
-    7,   # burned_disturbed
-    12,  # bare_ground
-    13,  # built_up_infrastructure
-    8,   # snow_cover
-    10,  # rock_alpine_bare
-    11,  # alpine_tundra
-    3,   # cultivated_agriculture
-    2,   # grassland_herbaceous
-    1,   # shrub_early_regrowth
-    0,   # forest
-    14,  # cloud
-    15,  # shadow
+#: first, as class NAMES (classes.yaml): the order must survive classes being
+#: added / retired / renumbered, which a list of ids does not (the previous
+#: id list had silently drifted from the dense ids). Names absent from a
+#: study's classes.yaml are skipped; classes not listed rank after the listed
+#: ones. See docs/decisions/ambiguity_class_priority.md for the rationale.
+DEFAULT_CLASS_PRIORITY_NAMES: tuple[str, ...] = (
+    "open_water",
+    "ice_cover",
+    "firn",
+    "wetland_marsh",
+    "cutblock_harvest",
+    "burned_disturbed",
+    "bare_ground",
+    "built_up_infrastructure",
+    "snow_cover",
+    "sand_gravel",
+    "rock_alpine_bare",
+    "cultivated_agriculture",
+    "grassland_herbaceous",
+    "forest",
+    "cloud",
+    "shadow",
 )
+
+
+def default_priority_order(class_names) -> tuple[int, ...]:
+    """DENSE ids of ``DEFAULT_CLASS_PRIORITY_NAMES`` for this study's classes
+    (``class_names`` in classes.yaml order = dense id order), unlisted classes
+    appended in file order, imaging artifacts (cloud, shadow) last."""
+    names = list(class_names)
+    ordered = [names.index(n) for n in DEFAULT_CLASS_PRIORITY_NAMES if n in names]
+    artifacts = {names.index(n) for n in ("cloud", "shadow") if n in names}
+    rest = [i for i in range(len(names)) if i not in ordered]
+    head = [i for i in ordered if i not in artifacts]
+    tail = [i for i in ordered if i in artifacts]
+    return tuple(head + [i for i in rest if i not in artifacts] + tail + [i for i in rest if i in artifacts])
+
 
 DEFAULT_PATCH_SIZE = 256
 DEFAULT_STRIDE = 128
@@ -125,7 +131,7 @@ def apply_priority_rule(
 def probabilities_to_classes(
     probabilities: np.ndarray,
     ambiguity_threshold: float = 0.0,
-    priority_order: tuple[int, ...] = DEFAULT_CLASS_PRIORITY_ORDER,
+    priority_order: tuple[int, ...] = (),
 ) -> np.ndarray:
     """Reduce a ``(num_classes, H, W)`` probability volume to a class-index map."""
     probabilities = np.asarray(probabilities, dtype=np.float32)
@@ -162,7 +168,7 @@ def predict_scene(
     return_probabilities: bool = False,
     use_hann_weighting: bool = True,
     ambiguity_threshold: float = 0.0,
-    priority_order: tuple[int, ...] = DEFAULT_CLASS_PRIORITY_ORDER,
+    priority_order: tuple[int, ...] = (),
     nodata: int = 255,
     use_amp: bool = False,
 ):
@@ -251,7 +257,7 @@ def predict_scene_sklearn(
     num_classes: int,
     valid_mask: Optional[np.ndarray] = None,
     ambiguity_threshold: float = 0.0,
-    priority_order: tuple[int, ...] = DEFAULT_CLASS_PRIORITY_ORDER,
+    priority_order: tuple[int, ...] = (),
     nodata: int = 255,
 ):
     """Run inference for the non-torch model types (threshold, random_forest,

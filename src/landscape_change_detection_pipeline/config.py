@@ -1161,6 +1161,10 @@ class CompositesConfig(BaseModel):
     )
     default_rule: str = "median"
     class_rules: list[CompositeClassRule] = Field(default_factory=list)
+    ignore_classes: list[str] = Field(default_factory=lambda: ["cloud", "shadow"])
+    """Class names (classes.yaml) that cast no vote in a monthly composite, so a
+    month is decided by its clear observations only. ``[]`` lets them vote (a
+    cloud-majority pixel then becomes ``cloud`` in the composite)."""
     output_root: str = "outputs/composites"
 
     #: scripts/07_build_monthly_composites.py's own run parameters --
@@ -1654,6 +1658,7 @@ class VegetationDynamicsConfig(BaseModel):
     tiles: list[str] = Field(default_factory=list)
     overwrite: bool = False
     workers: int = 1
+    cube_workers: int = 1
     month_threads: int = 4
     block_rows: int = 64
     indices: list[str] = Field(default_factory=lambda: ["NDVI"])
@@ -1740,6 +1745,67 @@ class RecoveryAnalysisConfig(BaseModel):
     curves: RecoveryCurvesConfig = Field(default_factory=RecoveryCurvesConfig)
     succession: SuccessionConfig = Field(default_factory=SuccessionConfig)
     factors: RecoveryFactorsConfig = Field(default_factory=RecoveryFactorsConfig)
+
+
+class FeatureImportanceMethodConfig(BaseModel):
+    enabled: bool = True
+
+
+class FeatureImportanceConfig(BaseModel):
+    """Which input features / classes matter (``scripts/05c_feature_importance.py``).
+
+    Only ``model.type`` = ``unet`` or ``catboost`` is supported: the analysis was
+    not set up or tuned for any other model type, and the script refuses them.
+    Every method has its own ``enabled``. Results are one ``.npz`` of ``tbl_*``
+    tables under ``output_root`` (exportable as CSV from ``scripts/export_gui.py``).
+    """
+
+    enabled: bool = True
+    output_root: str = "outputs/feature_importance"
+    checkpoint_path: Optional[str] = None
+    """null = ``<training.checkpoint_dir>/<model.type>_best.<pt|joblib>``."""
+    device: Optional[str] = None
+    split: str = "val"
+    """Scenes the importance is measured on: train | val | test."""
+    max_scenes: int = 30
+    """Scenes the unet permutation draws patches from (0 = all of the split)."""
+    patches_per_scene: int = 8
+    """unet permutation: random labelled patches (training patch_size) cut per scene."""
+    batch_size: int = 32
+    """unet permutation: patches per forward pass."""
+    pixels_per_scene: int = 3000
+    """Labelled pixels sampled per scene for the CatBoost-based methods."""
+    proxy_iterations: int = 300
+    """Max CatBoost iterations of the proxy / drop-column fits."""
+    drop_threshold: float = 0.01
+    """mIoU drop at or below this = unimportant (drop-column; ~ the fit-to-fit noise)."""
+    corr_threshold: float = 0.95
+    feature_groups: dict[str, list[str]] = Field(
+        default_factory=lambda: {
+            "chromaticity(r,g,b)": ["r", "g", "b"],
+            "tasseled_cap": ["TC_BRIGHTNESS", "TC_GREENNESS", "TC_WETNESS"],
+            "dem(elevation,slope)": ["elevation", "slope"],
+            "doy(sin,cos)": ["doy_sin", "doy_cos"],
+            "swir_indices": ["NDSI", "NDWI_GAO", "NBR", "ND_SWIR1_SWIR2"],
+            "blue/green_ratios": ["ND_BLUE_RED", "ND_BLUE_NIR", "ND_GREEN_RED"],
+        }
+    )
+    """Channels also destroyed together as one extra row ({} = no group rows)."""
+
+    class PermutationConfig(FeatureImportanceMethodConfig):
+        repeats: int = 3
+
+    class ShapConfig(FeatureImportanceMethodConfig):
+        per_class: int = 3000
+
+    class SeparabilityConfig(FeatureImportanceMethodConfig):
+        pixels_per_class: int = 20000
+        weak_below: float = 1.5
+
+    permutation: PermutationConfig = Field(default_factory=PermutationConfig)
+    shap: ShapConfig = Field(default_factory=ShapConfig)
+    dropcolumn: FeatureImportanceMethodConfig = Field(default_factory=FeatureImportanceMethodConfig)
+    separability: SeparabilityConfig = Field(default_factory=SeparabilityConfig)
 
 
 class ChangeMapsConfig(BaseModel):
@@ -1833,6 +1899,7 @@ class PipelineConfig(BaseModel):
     change_maps: ChangeMapsConfig = Field(default_factory=ChangeMapsConfig)
     vegetation_dynamics: VegetationDynamicsConfig = Field(default_factory=VegetationDynamicsConfig)
     recovery_analysis: RecoveryAnalysisConfig = Field(default_factory=RecoveryAnalysisConfig)
+    feature_importance: FeatureImportanceConfig = Field(default_factory=FeatureImportanceConfig)
 
 
 def _substitute_env_vars(raw_text: str) -> str:

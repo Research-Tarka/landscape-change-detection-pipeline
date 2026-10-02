@@ -47,6 +47,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import multiprocessing
 import sys
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -90,9 +91,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def _build_one_tile(tile_id: str, config, class_config) -> tuple[str, Optional[str], dict]:
+def _build_one_tile(tile_id: str, config, class_config, io_gate=None) -> tuple[str, Optional[str], dict]:
     """One tile, run in a worker process. Returns ``(tile_id, skip_reason_or_None,
-    summary)``; ``summary`` maps each written product to its path."""
+    summary)``; ``summary`` maps each written product to its path.
+
+    ``io_gate`` (a cross-process semaphore, optional) limits how many tiles are
+    in the heavy disk phase (class composites + monthly cube) at once; it is
+    released as soon as the cube is built, so the per-pixel compute runs in
+    parallel up to ``workers``."""
     vd, ra = config.vegetation_dynamics, config.recovery_analysis
     prefix = f"[vegetation_dynamics] {tile_id}: "
     t_start = time.time()
@@ -140,17 +146,23 @@ def _build_one_tile(tile_id: str, config, class_config) -> tuple[str, Optional[s
 
     need_stack = (bool(vd.mask_classes) and (do_vd or do_ra)) or (do_ra and ra.succession.enabled)
     class_stack = None
-    if need_stack:
-        print(f"{prefix}reading monthly class composites...", flush=True)
-        class_stack = build_monthly_class_stack(config.composites.output_root, tile_id, all_months, dst_transform, crs_wkt, shape)
     mask_ids = tuple(class_config.by_name(n).id for n in vd.mask_classes)
     indices = list(vd.indices)
 
     work_dir = Path(vd.output_root) / tile_id / "_work"
-    cubes = build_index_cubes(
-        config.dem.tile_dir, config.inference.output_root, tile_id, class_config, all_months, indices,
-        dst_transform, crs_wkt, shape, work_dir, class_stack, mask_ids, vd.month_threads,
-    )
+    if io_gate is not None:
+        io_gate.acquire()
+    try:
+        if need_stack:
+            print(f"{prefix}reading monthly class composites...", flush=True)
+            class_stack = build_monthly_class_stack(config.composites.output_root, tile_id, all_months, dst_transform, crs_wkt, shape)
+        cubes = build_index_cubes(
+            config.dem.tile_dir, config.inference.output_root, tile_id, class_config, all_months, indices,
+            dst_transform, crs_wkt, shape, work_dir, class_stack, mask_ids, vd.month_threads,
+        )
+    finally:
+        if io_gate is not None:
+            io_gate.release()
     written: dict[str, str] = {}
     try:
         break_idx = latest_break_year_index(segments, calendar.year0)
@@ -214,10 +226,12 @@ def main(argv: list[str] | None = None) -> int:
         for tile_id in tile_ids:
             n_done += _report(*_build_one_tile(tile_id, config, class_config))
     else:
-        with ProcessPoolExecutor(max_workers=vd.workers) as pool:
-            futures = [pool.submit(_build_one_tile, tile_id, config, class_config) for tile_id in tile_ids]
-            for future in as_completed(futures):
-                n_done += _report(*future.result())
+        with multiprocessing.Manager() as manager:
+            io_gate = manager.Semaphore(max(1, vd.cube_workers))
+            with ProcessPoolExecutor(max_workers=vd.workers) as pool:
+                futures = [pool.submit(_build_one_tile, tile_id, config, class_config, io_gate) for tile_id in tile_ids]
+                for future in as_completed(futures):
+                    n_done += _report(*future.result())
 
     print(f"[vegetation_dynamics] {n_done}/{len(tile_ids)} tiles processed")
     return 0

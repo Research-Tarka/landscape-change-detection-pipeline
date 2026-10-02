@@ -75,6 +75,7 @@ def _build_one_tile(
     sensor_priority: tuple[str, ...],
     default_rule: str,
     class_rules: dict[int, tuple[str, int]],
+    ignore_class_ids: tuple[int, ...],
     overwrite: bool,
     progress_queue: "multiprocessing.Queue | None",
 ) -> tuple[str, int]:
@@ -98,6 +99,7 @@ def _build_one_tile(
         class_rules=class_rules,
         overwrite=overwrite,
         progress_callback=callback,
+        ignore_class_ids=ignore_class_ids,
     )
     return tile_id, len(written)
 
@@ -106,8 +108,13 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(list(argv if argv is not None else sys.argv[1:]))
     config = load_config(args.config, args.env_file)
     class_config = load_class_config(args.classes)
-    num_classes = len(class_config.classes)
+    # The class maps hold RAW ids (06 converts dense -> raw), which are not
+    # contiguous (e.g. 11/12 retired, 16/17 appended): the vote arrays must be
+    # sized by the highest raw id, not by the class count, or a class whose id
+    # is >= len(classes) silently casts no vote.
+    num_classes = max(c.id for c in class_config.classes) + 1
     comp_cfg = config.composites
+    ignore_class_ids = tuple(class_config.by_name(n).id for n in comp_cfg.ignore_classes)
 
     class_rules = {rule.class_id: (rule.rule, rule.priority) for rule in comp_cfg.class_rules}
 
@@ -121,6 +128,7 @@ def main(argv: list[str] | None = None) -> int:
         tuple(comp_cfg.sensor_resolution_priority),
         comp_cfg.default_rule,
         class_rules,
+        ignore_class_ids,
         comp_cfg.overwrite,
     )
 
