@@ -34,9 +34,10 @@ From every stored month of that water year (a tile can have gaps -- no
 scene that month, or Stage 7 not yet run on it -- so ``n_months_observed``
 records the real denominator, never assumed to be 12):
 
-- ``n_months_snow``/``n_months_ice``/``n_months_water`` -- how many observed
-  months this pixel's dominant class was ``snow_cover``/``ice_cover``/
-  ``open_water``.
+- ``n_months_snow``/``n_months_firn``/``n_months_ice``/``n_months_water`` --
+  how many observed months this pixel's dominant class was ``snow_cover``/
+  ``firn``/``ice_cover``/``open_water``. ``firn`` is optional in classes.yaml:
+  without it ``n_months_firn`` is all zeros.
 - ``first_snow_month``/``last_snow_month`` -- the water-year-relative month
   index (1 = the water year's first month) of the first/last observed snow
   month, ``-1`` if none observed. A snow-free-season proxy follows directly
@@ -138,6 +139,7 @@ def build_tile_snow_water_dynamics(
     snow_id = class_config.by_name("snow_cover").id
     ice_id = class_config.by_name("ice_cover").id
     water_id = class_config.by_name("open_water").id
+    firn_id = class_config.by_name("firn").id if any(c.name == "firn" for c in class_config.classes) else None
 
     reference = read_composite(composite_output_path(composites_root, tile_id, periods[0]))
     dst_transform, dst_crs_wkt = reference["transform"], reference["crs_wkt"]
@@ -151,6 +153,7 @@ def build_tile_snow_water_dynamics(
     n_observed = np.zeros((n_years, height, width), dtype=np.uint8)
     n_snow = np.zeros((n_years, height, width), dtype=np.uint8)
     n_ice = np.zeros((n_years, height, width), dtype=np.uint8)
+    n_firn = np.zeros((n_years, height, width), dtype=np.uint8)
     n_water = np.zeros((n_years, height, width), dtype=np.uint8)
     first_snow = np.full((n_years, height, width), NODATA_MONTH, dtype=np.int8)
     last_snow = np.full((n_years, height, width), NODATA_MONTH, dtype=np.int8)
@@ -171,6 +174,8 @@ def build_tile_snow_water_dynamics(
             is_snow = valid & (class_map == snow_id)
             n_snow[yi] += is_snow
             n_ice[yi] += valid & (class_map == ice_id)
+            if firn_id is not None:
+                n_firn[yi] += valid & (class_map == firn_id)
             n_water[yi] += valid & (class_map == water_id)
 
             month_idx = water_year_month_index(month, water_year_start_month)
@@ -185,6 +190,7 @@ def build_tile_snow_water_dynamics(
         n_months_observed=n_observed,
         n_months_snow=n_snow,
         n_months_ice=n_ice,
+        n_months_firn=n_firn,
         n_months_water=n_water,
         first_snow_month=first_snow,
         last_snow_month=last_snow,
@@ -204,6 +210,8 @@ def read_snow_water_dynamics(path: str | Path) -> dict:
             "n_months_observed": np.array(data["n_months_observed"]),
             "n_months_snow": np.array(data["n_months_snow"]),
             "n_months_ice": np.array(data["n_months_ice"]),
+            "n_months_firn": (np.array(data["n_months_firn"]) if "n_months_firn" in data.files
+                              else np.zeros_like(data["n_months_ice"])),  # files from before firn existed
             "n_months_water": np.array(data["n_months_water"]),
             "first_snow_month": np.array(data["first_snow_month"]),
             "last_snow_month": np.array(data["last_snow_month"]),

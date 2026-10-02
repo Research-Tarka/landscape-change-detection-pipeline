@@ -471,7 +471,7 @@ inference:
   # argmax always (default -- no calibration study has been run yet for this
   # project).
   ambiguity_threshold: null
-  class_priority_order: []              # empty = use the built-in default order (see inference/engine.py::DEFAULT_CLASS_PRIORITY_ORDER); or e.g. [7, 6, 8, 11, 9, 10, 5, 4, 3, 0, 1, 2, 12, 13] to override
+  class_priority_order: []              # empty = use the built-in default order (inference/engine.py::DEFAULT_CLASS_PRIORITY_NAMES, resolved against classes.yaml); or an explicit list of DENSE ids to override
   checkpoint_path: null                  # null = <training.checkpoint_dir>/<model.type>_best.<pt|joblib>
   tiles: []                              # empty = every tile in the registry
   sensors: []                            # empty = every sensor (l5, l7, l8, l9, s2)
@@ -492,13 +492,20 @@ composites:
   default_rule: median                  # median | any_occurrence | fallback_occurrence, per class_id below
   # Per-class override of default_rule. class_id values below match this
   # project's own configs/classes.yaml -- adjust to your own taxonomy.
+  # Raw class ids (classes.yaml `id`), not dense. Transient states fill in only
+  # where nothing else won the month's majority; precedence (lower priority wins):
+  # snow > firn > ice > any other class.
   class_rules:
-    - class_id: 9   # ice_cover: transient, fills in only if nothing else won the month's majority; beats snow
+    - class_id: 8   # snow_cover
       rule: fallback_occurrence
       priority: 1
-    - class_id: 8   # snow_cover: transient, fills in only if nothing else won the month's majority
+    - class_id: 16  # firn (remove this rule if classes.yaml has no firn class)
       rule: fallback_occurrence
       priority: 2
+    - class_id: 9   # ice_cover
+      rule: fallback_occurrence
+      priority: 3
+  ignore_classes: [cloud, shadow]       # cast no vote in a month's composite (a month is decided by its clear observations); [] = they vote
   output_root: outputs/composites
   tiles: []                              # empty = every tile in the registry
   overwrite: false
@@ -539,7 +546,7 @@ change_detection:
   features: [NBR, NDVI, NDWI_GAO, TC_BRIGHTNESS]
   # Classes whose observations are excluded entirely (not usable land-surface
   # signal, not "changed").
-  masked_classes: [cloud, shadow, snow_cover, ice_cover, open_water]
+  masked_classes: [cloud, shadow, snow_cover, firn, ice_cover, open_water]
   p_change: 0.999                         # chi-square probability level of the per-observation change test
   conse: 4                               # consecutive exceeding observations required to confirm a break
   init_obs: 18                           # minimum clear observations in a segment's initial window
@@ -618,7 +625,7 @@ landcover_persistence:
   window_size: 5                        # observed months in the sliding majority-vote window
   min_fraction: 0.8                      # >= this fraction of the last window_size OBSERVED months must show the class to start it
   end_fraction: 0.2                      # ... and <= this fraction to end it (hysteresis)
-  masked_classes: [cloud, shadow, snow_cover, ice_cover]   # unobserved months: skipped by the vote
+  masked_classes: [cloud, shadow, snow_cover, firn, ice_cover]   # unobserved months: skipped by the vote
   default_min_duration_months: 12        # drop intervals shorter than this
   min_duration_months: {}                # per-class override, e.g. {burned_disturbed: 6}
   require_break_classes: [burned_disturbed]  # need a Stage 09 break (NBR/NDVI fall) at the start
@@ -654,7 +661,7 @@ event_typing:
   grass_class: grassland_herbaceous
   bare_class: bare_ground
   burned_class: burned_disturbed
-  masked_classes: [cloud, shadow, snow_cover, ice_cover]   # unobserved months: skipped
+  masked_classes: [cloud, shadow, snow_cover, firn, ice_cover]   # unobserved months: skipped
   min_drop: 0.15                        # NBR/NDVI fall that makes a break a loss
   min_fraction: 0.8                     # >= this forest share of a season = forest (before / recovered)
   end_fraction: 0.2                     # <= this forest share of a season = cleared
@@ -689,7 +696,7 @@ vegetation_dynamics:
   growing_season: [5, 10]               # months (May-October) of the yearly mean / anomaly
   min_gs_obs: 2                         # observed growing-season months a year needs for its yearly mean / max
   min_year_obs: 5                       # observed months (whole year) a year needs for a phenology fit
-  mask_classes: [cloud, shadow, snow_cover, ice_cover, open_water]   # months whose class composite is one of these are dropped (an index under snow is not vegetation)
+  mask_classes: [cloud, shadow, snow_cover, firn, ice_cover, open_water]   # months whose class composite is one of these are dropped (an index under snow is not vegetation)
   phenology:
     enabled: true                       # peak month/value, amplitude, season start / end / length (day of year), per year
     sos_fraction: 0.5                   # season start/end = curve crossing low + fraction * (peak - low)
@@ -743,3 +750,44 @@ recovery_analysis:
     slope_bins_deg: [0, 5, 15, 30, 90]
     aspect_sectors: 8
     min_group_size: 5                   # smaller groups are left out of the binned summary
+
+# ----------------------------------------------------------------------
+# Feature / class importance (scripts/05c_feature_importance.py).
+# Which input features does the model need, which classes are separable?
+# ONLY model.type unet or catboost: not set up or tuned for the others, the
+# script refuses them. Every method has its own `enabled`. Output: one .npz of
+# tbl_* tables (CSV via scripts/export_gui.py). For a unet run, shap and
+# dropcolumn use a CatBoost PROXY fitted on a pixel sample (spectral signal only).
+# ----------------------------------------------------------------------
+feature_importance:
+  enabled: true
+  output_root: outputs/feature_importance
+  checkpoint_path: null                 # null = <training.checkpoint_dir>/<model.type>_best.<pt|joblib>
+  device: null                          # null = auto (cuda if available)
+  split: val                            # scenes the importance is measured on: train | val | test
+  max_scenes: 30                        # scenes the unet permutation draws patches from (0 = all of the split)
+  patches_per_scene: 8                  # unet permutation: random labelled patches (training.patch_size) per scene
+  batch_size: 32                        # unet permutation: patches per forward pass
+  pixels_per_scene: 3000                # labelled pixels sampled per scene (CatBoost-based methods)
+  proxy_iterations: 300                 # max CatBoost iterations of the proxy / drop-column fits
+  drop_threshold: 0.01                  # drop-column mIoU change <= this = unimportant (~ fit-to-fit noise); with SHAP <= 10% of the top feature = drop candidate
+  corr_threshold: 0.95                  # |r| at or above = redundant pair
+  feature_groups:                       # channels also destroyed together as one extra row ({} = none)
+    chromaticity(r,g,b): [r, g, b]
+    tasseled_cap: [TC_BRIGHTNESS, TC_GREENNESS, TC_WETNESS]
+    dem(elevation,slope): [elevation, slope]
+    doy(sin,cos): [doy_sin, doy_cos]
+    swir_indices: [NDSI, NDWI_GAO, NBR, ND_SWIR1_SWIR2]
+    blue/green_ratios: [ND_BLUE_RED, ND_BLUE_NIR, ND_GREEN_RED]
+  permutation:
+    enabled: true                       # score drop when a feature is destroyed (unet: channel swapped with another val scene; catboost: shuffled)
+    repeats: 3                          # mean +/- std over this many draws
+  shap:
+    enabled: true                       # per-class mean |SHAP| (CatBoost TreeSHAP) on a class-balanced pixel sample
+    per_class: 3000
+  dropcolumn:
+    enabled: true                       # retrain CatBoost without each feature (slowest; immune to redundancy masking)
+  separability:
+    enabled: true                       # model-free Jeffries-Matusita distance between annotated classes (0 identical .. 2 separable)
+    pixels_per_class: 20000
+    weak_below: 1.5                     # pairs under this get their best single features listed

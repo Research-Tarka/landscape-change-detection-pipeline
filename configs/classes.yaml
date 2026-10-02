@@ -51,6 +51,12 @@
 # seasonal snow on ground/vegetation and frozen water bodies have distinct
 # spectral/textural signatures and very different ecological meaning
 # (winter water access).
+# `firn` (id 16, between snow and glacier ice: old compacted snow that has
+# survived a melt season, spectrally in between) and `sand_gravel` (id 17,
+# river bars, beaches, outwash, dunes -- brighter and more SWIR-reflective than
+# bare_ground) were appended later (ids 14/15 dense). Both are OPTIONAL for
+# other studies: a classes.yaml without them works as is. The composite
+# precedence snow > firn > ice > other lives in config composites.class_rules.
 # ----------------------------------------------------------------------
 
 classes:
@@ -137,3 +143,15 @@ classes:
     display_name: "Shadow"
     color: [40, 40, 40]
     change_eligible: false
+
+  - id: 16
+    name: firn
+    display_name: "Firn (old compacted snow on a glacier or perennial snowfield: survived at least one melt season, between snow and glacier ice)"
+    color: [200, 215, 240]
+    change_eligible: true
+
+  - id: 17
+    name: sand_gravel
+    display_name: "Sand / gravel (river bars, beaches, outwash plains, dunes -- bright, sparsely vegetated mineral surface)"
+    color: [245, 226, 160]
+    change_eligible: true

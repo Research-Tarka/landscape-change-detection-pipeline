@@ -275,8 +275,13 @@ def build_monthly_composite(
     default_rule: str,
     class_rules: dict[int, tuple[str, int]],
     nodata: int = 255,
+    ignore_class_ids: tuple[int, ...] = (),
 ) -> dict:
     """Reduce one tile-month's scene class maps to one composite.
+
+    ``ignore_class_ids``: raw class ids whose pixels cast no vote at all
+    (treated as nodata) -- typically cloud/shadow, so a month is decided by
+    its clear observations only.
 
     ``class_rules`` is ``{class_id: (rule, priority)}`` for classes with a
     non-default rule; every other class uses ``default_rule`` with priority
@@ -287,6 +292,8 @@ def build_monthly_composite(
         raise ValueError("build_monthly_composite requires at least one scene")
 
     stack, reference = _aligned_stack(scenes, sensor_priority)
+    if ignore_class_ids:
+        stack = np.where(np.isin(stack, list(ignore_class_ids)), nodata, stack).astype(stack.dtype)
     height, width = stack.shape[1:]
 
     counts = _per_class_vote_counts(stack, num_classes, nodata)
@@ -398,6 +405,7 @@ def build_all_monthly_composites(
     nodata: int = 255,
     overwrite: bool = False,
     progress_callback=None,
+    ignore_class_ids: tuple[int, ...] = (),
 ) -> list[Path]:
     """Build every tile-month composite available for one tile. Returns the
     paths actually (re)written.
@@ -422,7 +430,8 @@ def build_all_monthly_composites(
             pass
         else:
             result = build_monthly_composite(
-                groups[month], num_classes, sensor_priority, default_rule, class_rules, nodata
+                groups[month], num_classes, sensor_priority, default_rule, class_rules, nodata,
+                ignore_class_ids,
             )
             write_composite(out_path, result)
             written.append(out_path)

@@ -50,7 +50,7 @@ from landscape_change_detection_pipeline.config import (  # noqa: E402
     resolved_feature_names,
 )
 from landscape_change_detection_pipeline.inference.engine import (  # noqa: E402
-    DEFAULT_CLASS_PRIORITY_ORDER,
+    default_priority_order,
     predict_scene,
     predict_scene_sklearn,
     scene_output_paths,
@@ -274,7 +274,7 @@ def _process_one_scene_impl(
                 stride=inf_cfg.stride,
                 batch_size=inf_cfg.batch_size,
                 ambiguity_threshold=inf_cfg.ambiguity_threshold or 0.0,
-                priority_order=tuple(inf_cfg.class_priority_order) or DEFAULT_CLASS_PRIORITY_ORDER,
+                priority_order=tuple(inf_cfg.class_priority_order) or default_priority_order([c.name for c in class_config.classes]),
             )
         else:
             class_map = predict_scene_sklearn(
@@ -282,7 +282,7 @@ def _process_one_scene_impl(
                 features,
                 loaded.num_classes,
                 ambiguity_threshold=inf_cfg.ambiguity_threshold or 0.0,
-                priority_order=tuple(inf_cfg.class_priority_order) or DEFAULT_CLASS_PRIORITY_ORDER,
+                priority_order=tuple(inf_cfg.class_priority_order) or default_priority_order([c.name for c in class_config.classes]),
             )
         # predict_scene[_sklearn] return dense class ids (0..N-1, model
         # output-channel order) -- class_map.npz is a boundary artifact read
