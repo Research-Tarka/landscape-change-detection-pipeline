@@ -146,11 +146,14 @@ def _build_feature_stack_for_scene(
     with, or the mismatch check below raises."""
     import numpy as np
 
+    from landscape_change_detection_pipeline.features.scene_context import scene_context_vector
     from landscape_change_detection_pipeline.features.spectral_indices import (
         DOY_FEATURE_NAMES,
         LATLON_FEATURE_NAMES,
         compute_indices,
+        dem_layer_to_channels,
         doy_cyclical_stack,
+        expand_dem_feature_names,
         latlon_stack,
     )
     from landscape_change_detection_pipeline.features.training_cache import (
@@ -172,13 +175,13 @@ def _build_feature_stack_for_scene(
         arr, dem_transform, dem_crs = _cached_read_tile_dem(tile_dir, tile_id, name)
         if tuple(arr.shape) != tuple(dst_shape):
             arr = _resample_dem_to_sensor_grid(arr, dem_transform, dem_crs, dst_shape, dst_transform, dst_crs)
-        dem_arrays.append(arr)
+        dem_arrays.extend(dem_layer_to_channels(name, arr))
     dem_stack = np.stack(dem_arrays, axis=0).astype(np.float32) if dem_arrays else np.zeros(
         (0, *dst_shape), dtype=np.float32
     )
 
     stacks = [index_stack, dem_stack]
-    built_names = [*index_names, *dem_layer_names]
+    built_names = [*index_names, *expand_dem_feature_names(dem_layer_names)]
 
     if include_doy_features:
         acquisition_date = scene_date(sensor, scene_id)
@@ -195,7 +198,7 @@ def _build_feature_stack_for_scene(
             f"Feature order mismatch for {tile_id}/{sensor}/{scene_id}: checkpoint expects "
             f"{feature_names}, got {built_names}"
         )
-    return stack
+    return stack, scene_context_vector(sensor, scene_id, dst_transform, dst_crs, tuple(dst_shape))
 
 
 def _worker_init(
@@ -255,7 +258,7 @@ def _process_one_scene_impl(
         return tile_id, sensor, scene_id, "skip", "already done"
 
     try:
-        features = _build_feature_stack_for_scene(
+        features, context = _build_feature_stack_for_scene(
             config.dem.tile_dir, tile_id, sensor, scene_id, loaded.feature_names,
             index_names, dem_layer_names,
             config.features.include_doy_features, config.features.include_latlon_features,
@@ -275,6 +278,7 @@ def _process_one_scene_impl(
                 batch_size=inf_cfg.batch_size,
                 ambiguity_threshold=inf_cfg.ambiguity_threshold or 0.0,
                 priority_order=tuple(inf_cfg.class_priority_order) or default_priority_order([c.name for c in class_config.classes]),
+                context=context,
             )
         else:
             class_map = predict_scene_sklearn(

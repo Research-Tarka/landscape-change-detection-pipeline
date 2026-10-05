@@ -18,6 +18,7 @@ Usage
 CLI flags -- a run must be reproducible from ``config.yaml`` alone. Only
 ``--config``/``--env-file``/``--classes`` (which files to read) stay as
 flags.
++
 
 Progress reporting
 -------------------

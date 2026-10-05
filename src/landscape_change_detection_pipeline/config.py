@@ -436,8 +436,10 @@ def all_resolved_feature_names(features: FeaturesConfig) -> tuple[str, ...]:
     in ``build_feature_stack``'s own order: spectral indices, DEM layers,
     then (if enabled) DOY, then lat/lon. This is the list whose length is
     the model's real input channel count."""
+    from landscape_change_detection_pipeline.features.spectral_indices import expand_dem_feature_names
+
     index_names, dem_layer_names = resolved_feature_names(features)
-    return (*index_names, *dem_layer_names, *resolved_extra_feature_names(features))
+    return (*index_names, *expand_dem_feature_names(dem_layer_names), *resolved_extra_feature_names(features))
 
 
 class SplitConfig(BaseModel):
@@ -686,11 +688,16 @@ class UnetConfig(BaseModel):
     keyword arguments and defaults exactly).
 
     ``base_ch`` is the first encoder stage's channel width (doubling at each
-    of the three subsequent stages). ``use_spatial_context`` enables FiLM
-    conditioning of the first encoder stage on ``(x, y, year_norm,
-    area_norm)``; ``use_sensor_film`` additionally folds a learned sensor
-    embedding into that conditioning and only has an effect when
-    ``num_sensors > 1``. ``norm_type="group"`` is incompatible with
+    subsequent stage); ``depth`` is the number of levels (default 4 = three
+    poolings; ``training.patch_size`` / ``inference.patch_size`` must be divisible
+    by ``2 ** (depth - 1)``). ``film_sensor`` / ``film_doy`` /
+    ``film_latlon`` switch on FiLM conditioning of the encoder and decoder
+    stages, each independently, on the scene's sensor (learned embedding of
+    L5/L7/L8/L9/S2), its acquisition day-of-year (sin/cos) and its centroid
+    position -- all derived from the scene alone (see
+    ``features/scene_context.py``). All off = a plain U-Net.
+    ``num_sensors`` is only the size of the optional per-sensor normalisation
+    bank (leave at 1; FiLM does not need it). ``norm_type="group"`` is incompatible with
     ``num_sensors > 1`` (see ``UNet``'s own validation). ``bottleneck_attention``
     inserts self-attention over the bottleneck grid; ``deep_supervision``
     attaches auxiliary decoder-level logit heads used only during training.
@@ -698,9 +705,11 @@ class UnetConfig(BaseModel):
 
     base_ch: int = 48
     dropout_p: float = 0.0
-    use_spatial_context: bool = False
+    depth: int = 4
     num_sensors: int = 1
-    use_sensor_film: bool = False
+    film_sensor: bool = False
+    film_doy: bool = False
+    film_latlon: bool = False
     norm_type: str = "batch"
     bottleneck_attention: bool = False
     bottleneck_attention_heads: int = 8
@@ -918,6 +927,17 @@ class TrainingConfig(BaseModel):
     #: over the whole ``batch_size`` -- same optimisation step, far less VRAM
     #: (activations dominate). null = whole batch at once.
     micro_batch_size: Optional[int] = None
+    #: Random training patches drawn per epoch. ``None`` = one per training scene, which is a
+    #: tiny epoch (e.g. 123 scenes = ~4 optimiser steps at batch 32) with a full validation pass
+    #: after each. Set it to a few dozen steps' worth (e.g. 1024 = 32 steps at batch 32) so that
+    #: ``epochs``, ``patience`` and ``hpo.trial_epochs`` count meaningful units.
+    samples_per_epoch: Optional[int] = None
+    #: DataLoader RAM knobs. Each worker is a full Python process holding ``prefetch_factor``
+    #: prefetched batches (a batch of 32 x 256 px x 21 channels is ~180 MB), so training RAM is roughly
+    #: ``(num_workers + val_num_workers) x (process ~0.5 GB + prefetch_factor x batch)``.
+    #: ``val_num_workers: None`` = same as ``num_workers``.
+    prefetch_factor: int = 4
+    val_num_workers: Optional[int] = None
     patch_size: int = 256
     lr: float = 3e-4
     weight_decay: float = 1e-4
@@ -1026,6 +1046,15 @@ class HpoConfig(BaseModel):
 
     trials: int = 0
     trial_epochs: int = 25
+    #: Validation cost per trial epoch. Each trial scores the same ``val_patches_per_scene``
+    #: evenly spaced patches of every val scene (only used when ``training.samples_per_epoch``
+    #: is set; ``None`` = every patch, the slow exact score). The final retrain always
+    #: validates on everything.
+    val_patches_per_scene: Optional[int] = 4
+    #: ``>= 2``: score every trial as the mean best val metric over this many tile-grouped
+    #: folds of train+val (far less noisy than one small val split, ``k`` times the cost per
+    #: trial, no pruning). ``0`` = the single configured train/val split.
+    cv_folds: int = 0
     sampler: str = "tpe"
     pruner: str = "none"
     storage: Optional[str] = None
@@ -1469,13 +1498,29 @@ class EventTypingConfig(BaseModel):
     min_cleared_years: int = 3
     permanent_years: float = 8.0
     permanent_bare_fraction: float = 0.6
-    crop_season: list[int] = Field(default_factory=lambda: [5, 10])
-    crop_min_months_per_year: int = 2
-    crop_min_run_years: int = 4
-    crop_max_forest_fraction: float = 0.0
-    crop_allowed_gaps: int = 0
+    crop_season: list[int] = Field(default_factory=lambda: [6, 9])
+    crop_min_run_years: int = 8
+    crop_max_forest_fraction: float = 0.2
+    crop_open_fraction: float = 0.8
+    crop_min_bare_fraction: float = 0.03
+    crop_min_bare_year_fraction: float = 0.15
+    crop_end_gap_years: int = 2
+    crop_since_start_years: int = 1
+    fire_season: list[int] = Field(default_factory=lambda: [6, 8])
+    cleared_gap_seasons: int = 1
+    crop_min_patch_px: int = 300
+    crop_min_width_px: int = 5
+    pre_min_fraction: float = 0.5
+    object_fire_min_pixels: int = 2000
+    object_fire_burned: float = 0.10
+    object_fire_dnbr: float = 0.45
+    object_fire_dnbr_burned: float = 0.05
+    object_fire_local_burned: float = 0.03
+    linear_max_width_px: int = 3
+    linear_min_extent_px: int = 15
+    linear_gap_px: int = 3
 
-    @field_validator("cutblock_season", "crop_season")
+    @field_validator("cutblock_season", "crop_season", "fire_season")
     @classmethod
     def _validate_season(cls, value: list[int]) -> list[int]:
         if len(value) != 2 or not (1 <= value[0] <= value[1] <= 12):
@@ -1740,7 +1785,7 @@ class RecoveryAnalysisConfig(BaseModel):
     index: str = "NDVI"
     """The index (one of ``vegetation_dynamics.indices``) the curves are built on."""
     event_types: list[str] = Field(
-        default_factory=lambda: ["fire", "cutblock", "permanent_clearing", "canopy_decline", "other_loss"]
+        default_factory=lambda: ["fire", "cutblock", "permanent_clearing", "canopy_decline", "other_loss", "recent_clearing", "linear_feature", "open_land_disturbance", "regrowth_change", "cropland_change"]
     )
     curves: RecoveryCurvesConfig = Field(default_factory=RecoveryCurvesConfig)
     succession: SuccessionConfig = Field(default_factory=SuccessionConfig)

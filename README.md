@@ -100,7 +100,7 @@ Splits annotated scenes into train / val / test (`split.split_by`: `tile` is lea
 
 **The two supported models are `unet` and `catboost`.** The other types (`threshold`, `random_forest`, `lightgbm`, `deeplabv3plus`, `segformer`) are still in the code but have not been set up or tuned; if you switch to one, expect to do that work yourself. New analysis tools (05c) refuse them explicitly.
 
-- `unet`: the main model. Optional per-sensor conditioning (FiLM), attention at the bottleneck, deep supervision. Checkpoint: `models/checkpoints/unet_best.pt`, self-describing (weights, class names, feature names, normalization), so inference needs nothing else.
+- `unet`: the main model. Configurable depth, optional FiLM conditioning on sensor, day-of-year and scene position (`unet.film_sensor` / `film_doy` / `film_latlon`), attention at the bottleneck, deep supervision. Checkpoint: `models/checkpoints/unet_best.pt`, self-describing (weights, class names, feature names, normalization), so inference needs nothing else.
 - `catboost`: pixel-wise gradient boosting on GPU with Optuna search and early stopping. Fast, no spatial context.
 
 For the rare, confusable classes, the `training` section has levers that act on different things; try them roughly in this order:

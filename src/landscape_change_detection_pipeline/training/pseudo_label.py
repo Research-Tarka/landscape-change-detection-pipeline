@@ -174,6 +174,7 @@ def generate_pseudo_labels(
     up-to-date pseudo-label cache is skipped, same contract as
     :func:`~landscape_change_detection_pipeline.features.training_cache.export_all_annotated_scenes`.
     """
+    from landscape_change_detection_pipeline.features.scene_context import scene_context_vector
     from landscape_change_detection_pipeline.features.training_cache import (
         build_feature_stack,
         scene_cache_signature,
@@ -187,9 +188,11 @@ def generate_pseudo_labels(
     if max_scenes is not None:
         unlabeled = unlabeled[: int(max_scenes)]
 
+    from landscape_change_detection_pipeline.features.spectral_indices import expand_dem_feature_names
+
     feature_names = [
         *index_names,
-        *dem_layer_names,
+        *expand_dem_feature_names(dem_layer_names),
         *(("doy_sin", "doy_cos") if include_doy_features else ()),
         *(("lat_norm", "lon_norm") if include_latlon_features else ()),
     ]
@@ -269,6 +272,9 @@ def generate_pseudo_labels(
                 model, features, num_classes, mean, std,
                 patch_size=patch_size, stride=stride, batch_size=inference_batch_size,
                 return_probabilities=True, nodata=NODATA_LABEL, use_amp=use_amp,
+                context=scene_context_vector(
+                    scene.sensor, scene.scene_id, transform, crs_wkt, tuple(features.shape[1:])
+                ),
             )
 
             if label_remap is not None:

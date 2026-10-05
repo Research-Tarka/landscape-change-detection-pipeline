@@ -155,7 +155,7 @@ def main(argv: list[str] | None = None) -> int:
         run_bootstrap(
             config.bootstrap, config.hpo, training_cfg, config.model, train_records, val_records,
             mean, std, class_counts, num_classes, class_names, feature_names, run_root,
-            num_sensors=1, device=args.device,
+            num_sensors=(config.model.unet.num_sensors if model_type == "unet" else 1), device=args.device,
             num_spectral_channels=num_spectral_channels, pseudo_label_records=pseudo_label_records,
             evaluate_fn=lambda model: evaluate_all_splits(
                 model, model_type, splits, num_classes, class_names, mean=mean, std=std,
@@ -172,12 +172,24 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[train] bootstrap run written to {run_root}")
         return 0
 
-    from landscape_change_detection_pipeline.training.hpo import run_trials
+    from landscape_change_detection_pipeline.training.hpo import make_cv_folds, run_trials
+
+    cv_folds = None
+    if config.hpo.trials > 0 and config.hpo.cv_folds >= 2:
+        cv_folds = make_cv_folds(
+            train_records + val_records, config.hpo.cv_folds, class_pixel_counts, num_classes,
+            seed=config.split.split_seed, split_by=config.split.split_by,
+        )
+        print(
+            f"[hpo] {len(cv_folds)}-fold class-balanced CV (split_by={config.split.split_by!r}) over train+val "
+            f"(fold val sizes: {[len(v) for _, v in cv_folds]})"
+        )
 
     result, winning_training_cfg, winning_model_cfg, trial_records = run_trials(
         config.hpo, training_cfg, config.model, train_records, val_records, mean, std, class_counts,
-        num_classes, class_names, feature_names, num_sensors=1, device=args.device,
+        num_classes, class_names, feature_names, num_sensors=(config.model.unet.num_sensors if model_type == "unet" else 1), device=args.device,
         num_spectral_channels=num_spectral_channels, pseudo_label_records=pseudo_label_records,
+        cv_folds=cv_folds,
     )
     if trial_records:
         print(
@@ -198,7 +210,7 @@ def main(argv: list[str] | None = None) -> int:
         feature_names=feature_names,
         mean=mean,
         std=std,
-        num_sensors=1,
+        num_sensors=(config.model.unet.num_sensors if model_type == "unet" else 1),
     )
     checkpoint_path = Path(training_cfg.checkpoint_dir) / f"{model_type}_best.pt"
     out = save_checkpoint(checkpoint_path, result.model, meta)
@@ -358,6 +370,7 @@ def evaluate_val_records(
     (confusion accumulation, metrics) is identical for every model type, so
     this is the one place results across models are directly comparable.
     """
+    from landscape_change_detection_pipeline.features.scene_context import record_context
     from landscape_change_detection_pipeline.features.training_cache import load_scene_cache
     from landscape_change_detection_pipeline.inference.engine import predict_scene, predict_scene_sklearn
 
@@ -375,6 +388,7 @@ def evaluate_val_records(
             pred = predict_scene(
                 model, features, num_classes, mean, std,
                 patch_size=patch_size, stride=stride, batch_size=batch_size, nodata=IGNORE_INDEX,
+                context=record_context(record) if getattr(model, "uses_scene_context", False) else None,
             )
 
         if record.label_remap is not None:

@@ -42,6 +42,7 @@ a name neither config recognizes, rather than letting it disappear.
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -51,14 +52,17 @@ from landscape_change_detection_pipeline.training.metrics import canonical_main_
 from landscape_change_detection_pipeline.training.optuna_utils import build_pruner, build_sampler
 from landscape_change_detection_pipeline.training.train import TrainingResult, train_model
 
-__all__ = ["TrialRecord", "run_trials", "build_sampler", "build_pruner", "sanitise_overrides"]
+__all__ = ["TrialRecord", "run_trials", "make_cv_folds", "build_sampler", "build_pruner", "sanitise_overrides"]
 
 #: Every hyperparameter name this module's default search_space (or a
 #: config-overridden one) can legally target, and which config object +
 #: field actually holds it. Extend this table, not the search space alone,
 #: before naming a new hyperparameter in config -- an unlisted name fails
 #: loudly in _apply_overrides rather than being silently dropped.
-_TRAINING_FIELDS: tuple[str, ...] = ("lr", "weight_decay", "patch_size", "batch_size", "grad_clip_norm")
+_TRAINING_FIELDS: tuple[str, ...] = (
+    "lr", "weight_decay", "patch_size", "batch_size", "grad_clip_norm",
+    "focal_gamma", "dice_weight", "class_weight_power", "class_weight_max",
+)
 #: Model sub-config fields that live under ``model.<type>.<field>`` for
 #: whichever type is currently active -- resolved against model_cfg.type at
 #: override time, since e.g. "dropout_p" means a different object depending
@@ -84,6 +88,71 @@ class TrialRecord:
     @property
     def usable(self) -> bool:
         return not self.failed and math.isfinite(self.score) and self.score > -1e11
+
+
+def make_cv_folds(
+    records: list[SceneRecord],
+    k: int,
+    class_pixel_counts_by_scene: dict[str, Any],
+    num_classes: int,
+    seed: int = 0,
+    split_by: str = "scene",
+) -> list[tuple[list[SceneRecord], list[SceneRecord]]]:
+    """``k`` (train, val) splits, class- and size-balanced.
+
+    ``split_by`` follows ``split.split_by``: ``"tile"`` keeps every tile on one side of a
+    fold, ``"scene"`` treats each scene as its own group. Groups are assigned greedily
+    (rarest-class content first) to the fold whose per-class pixel share and scene count
+    they unbalance least, so every fold's val gets a similar class mix.
+    """
+    import random
+
+    import numpy as np
+
+    key = (lambda r: r.tile_id) if split_by == "tile" else (lambda r: r.scene_key)
+    groups: dict[str, list[SceneRecord]] = {}
+    for r in sorted(records, key=lambda r: r.sort_key):
+        groups.setdefault(key(r), []).append(r)
+    k = max(2, min(k, len(groups)))
+
+    zero = np.zeros(num_classes, dtype=np.float64)
+    counts = {
+        g: sum((np.asarray(class_pixel_counts_by_scene.get(r.scene_key, zero), dtype=np.float64) for r in rs), zero)
+        for g, rs in groups.items()
+    }
+    total = sum(counts.values()) + 1e-9
+    share = {g: c / total for g, c in counts.items()}  # fraction of each class's pixels in this group
+    rarity = np.where(total > 0, 1.0 / (total / total.sum() + 1e-6), 0.0)
+    names = sorted(groups)
+    random.Random(seed).shuffle(names)
+    names.sort(key=lambda g: -float((share[g] * rarity).sum()))  # stable: ties keep the seeded order
+
+    fold_share = [np.zeros(num_classes) for _ in range(k)]
+    fold_size = [0] * k
+    fold_groups: list[list[str]] = [[] for _ in range(k)]
+    target_size = len(records) / k
+    for g in names:
+        def cost(i: int) -> float:
+            s = fold_share[i] + share[g]
+            size = (fold_size[i] + len(groups[g])) / target_size
+            # minimising the squared load keeps every class (and the scene count) evenly spread
+            return float((s ** 2).sum()) + 0.05 * size ** 2
+        best = min(range(k), key=cost)
+        fold_share[best] += share[g]
+        fold_size[best] += len(groups[g])
+        fold_groups[best].append(g)
+
+    folds = []
+    for i in range(k):
+        val_keys = set(fold_groups[i])
+        folds.append((
+            [r for r in records if key(r) not in val_keys],
+            [r for r in records if key(r) in val_keys],
+        ))
+        missing = [c for c in range(num_classes) if fold_share[i][c] <= 0 and total[c] > 1e-6]
+        if missing:
+            print(f"[hpo] WARNING: fold {i + 1} val has no pixels of class(es) {missing}")
+    return folds
 
 
 def sanitise_overrides(overrides: dict[str, Any]) -> dict[str, Any]:
@@ -172,6 +241,7 @@ def run_trials(
     device: Optional[str] = None,
     num_spectral_channels: Optional[int] = None,
     pseudo_label_records: Optional[list[SceneRecord]] = None,
+    cv_folds: Optional[list[tuple[list[SceneRecord], list[SceneRecord]]]] = None,
 ) -> tuple[TrainingResult, TrainingConfig, ModelConfig, list[TrialRecord]]:
     """Run the search (if any) and return the final model.
 
@@ -208,14 +278,36 @@ def run_trials(
             update={"epochs": trial_epochs, "patience": min(training_cfg.patience, trial_epochs)}
         )
         print(f"[hpo] trial {trial.number + 1}/{hpo_cfg.trials} {overrides}")
+        started = time.time()
 
         try:
-            result = train_model(
-                trial_training_cfg, trial_model_cfg, train_records, val_records, mean, std, class_counts,
-                num_classes, class_names, feature_names, num_sensors=num_sensors, device=device,
-                progress=False, trial=trial,
-                num_spectral_channels=num_spectral_channels, pseudo_label_records=pseudo_label_records,
-            )
+            if cv_folds:
+                from landscape_change_detection_pipeline.training.dataset import (
+                    compute_class_counts, compute_mean_std,
+                )
+
+                fold_scores, result = [], None
+                for fold_i, (fold_train, fold_val) in enumerate(cv_folds):
+                    fold_mean, fold_std = compute_mean_std(fold_train)
+                    result = train_model(
+                        trial_training_cfg, trial_model_cfg, fold_train, fold_val, fold_mean, fold_std,
+                        compute_class_counts(fold_train, num_classes), num_classes, class_names,
+                        feature_names, num_sensors=num_sensors, device=device, progress=True,
+                        num_spectral_channels=num_spectral_channels, pseudo_label_records=pseudo_label_records,
+                        val_patches_per_scene=hpo_cfg.val_patches_per_scene,
+                    )
+                    fold_scores.append(float(result.best_state.get("val_metric", float("nan"))))
+                    print(f"[hpo]   fold {fold_i + 1}/{len(cv_folds)}: {fold_scores[-1]:.4f}")
+                finite = [s for s in fold_scores if math.isfinite(s)]
+                result.best_state["val_metric"] = sum(finite) / len(finite) if finite else float("nan")
+            else:
+                result = train_model(
+                    trial_training_cfg, trial_model_cfg, train_records, val_records, mean, std, class_counts,
+                    num_classes, class_names, feature_names, num_sensors=num_sensors, device=device,
+                    progress=True, trial=trial,
+                    num_spectral_channels=num_spectral_channels, pseudo_label_records=pseudo_label_records,
+                    val_patches_per_scene=hpo_cfg.val_patches_per_scene,
+                )
         except optuna.TrialPruned:
             # Re-raised after recording: this is not a failure, but Optuna
             # itself must still see the exception to mark the trial pruned
@@ -239,7 +331,8 @@ def run_trials(
             score = -1e12
         print(
             f"[hpo] trial {trial.number + 1}/{hpo_cfg.trials} finished: "
-            f"{metric_name}={score:.4f} (best epoch {result.best_epoch}/{trial_epochs})"
+            f"{metric_name}={score:.4f} (best epoch {result.best_epoch}/{trial_epochs}, "
+            f"{(time.time() - started) / 60:.1f} min)"
         )
         records.append(
             TrialRecord(trial_id=trial.number + 1, params=overrides, score=score, metrics=dict(result.best_state))

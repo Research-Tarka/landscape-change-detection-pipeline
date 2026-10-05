@@ -258,16 +258,18 @@ model:
     # each trial is fit cheaply at search_iterations, then the winning
     # params are refit once at this section's own `iterations` (the real,
     # full budget) -- "lots of cheap trials, then one real run" in one knob.
-    # n_trials: 30
-    # sampler: tpe                      # tpe | cmaes | random
-    # pruner: none                      # none | median | hyperband -- hyperband cuts a bad
-    #                                    # trial early from its per-round eval-set loss.
-    #                                    # CPU only: CatBoost supports neither pruning
-    #                                    # callbacks nor resumable fitting on GPU, so with
-    #                                    # task_type=GPU every trial still runs to completion
-    #                                    # regardless of this setting (a warning is logged).
-    # search_iterations: 500            # per-trial cap during the search (keep low: cheap exploration)
-    # search_early_stopping_rounds: 30
+    # Optuna search over (learning_rate, depth, l2_leaf_reg), scored by macro mIoU on val_records.
+    # n_trials <= 0 skips the search and fits once at the fixed hyperparameters above. Each trial is
+    # fit cheaply at search_iterations, then the winning params are refit once at `iterations`.
+    n_trials: 0
+    sampler: tpe                        # tpe | cmaes | random
+    pruner: none                        # none | median | hyperband. CPU only: CatBoost supports neither
+                                        # pruning callbacks nor resumable fitting on GPU, so with
+                                        # task_type=GPU every trial runs to completion (a warning is logged).
+    timeout_s: null                     # wall-clock cap on the whole search (seconds); null = no cap
+    study_storage: null                 # null = in-memory; or e.g. "sqlite:///catboost_study.db" to resume
+    search_iterations: 500              # per-trial cap during the search (keep low: cheap exploration)
+    search_early_stopping_rounds: 30
 
   # -- type: lightgbm -----------------------------------------------------
   # device: cpu is the confirmed-working default -- the standard `pip install
@@ -285,23 +287,28 @@ model:
     random_state: 0
     early_stopping_rounds: 50           # final refit only
     class_weighting: true               # inverse-frequency class weights -- rare classes learn poorly without this
-    # n_trials > 0 runs an Optuna search (learning_rate, num_leaves,
-    # min_data_in_leaf): each trial is fit cheaply at search_n_estimators,
-    # then the winning params are refit once at this section's own
-    # `n_estimators` (the real, full budget), scored by macro mIoU on val_records:
-    # n_trials: 30
-    # sampler: tpe                      # tpe | cmaes | random
-    # pruner: none                      # none | median | hyperband -- hyperband cuts a bad
-    #                                    # trial early from its per-round eval-set metric
-    # search_n_estimators: 500          # per-trial cap during the search (keep low: cheap exploration)
-    # search_early_stopping_rounds: 30
+    # Optuna search over (learning_rate, num_leaves, min_data_in_leaf), scored by macro mIoU on
+    # val_records. n_trials <= 0 skips the search and fits once at the fixed hyperparameters above.
+    # Each trial is fit cheaply at search_n_estimators, then the winning params are refit once at
+    # `n_estimators` (the real, full budget).
+    n_trials: 0
+    sampler: tpe                        # tpe | cmaes | random
+    pruner: none                        # none | median | hyperband -- cuts a bad trial early from its per-round eval-set metric
+    timeout_s: null                     # wall-clock cap on the whole search (seconds); null = no cap
+    study_storage: null                 # null = in-memory; or e.g. "sqlite:///lightgbm_study.db" to resume
+    search_n_estimators: 500            # per-trial cap during the search (keep low: cheap exploration)
+    search_early_stopping_rounds: 30
 
   # -- type: unet ---------------------------------------------------------
   unet:
-    base_ch: 48                         # first encoder stage's channel width (doubles each of the 3 deeper stages)
+    base_ch: 48                         # first encoder stage's channel width (doubles at each deeper level)
+    depth: 4                            # number of levels (4 = 3 poolings); patch_size must be divisible by 2**(depth-1)
     dropout_p: 0.0
-    use_spatial_context: false          # FiLM-conditions the first encoder stage on (x, y, year_norm, area_norm)
-    use_sensor_film: false              # only has an effect when training on more than one sensor at once
+    # FiLM conditioning of the encoder + decoder stages on scene-level context, each switch
+    # independent (all false = plain U-Net). Built from the scene alone; changes the checkpoint, retrain.
+    film_sensor: false                  # learned embedding of the scene's sensor (L5/L7/L8/L9/S2)
+    film_doy: false                     # acquisition day-of-year (sin/cos): seasonality
+    film_latlon: false                  # scene centroid lat/lon: geography (weak/overfit-prone on a single small region)
     norm_type: batch                    # batch | group -- group is incompatible with multi-sensor training
     bottleneck_attention: false         # self-attention over the bottleneck grid
     bottleneck_attention_heads: 8       # only read when bottleneck_attention is true
@@ -327,13 +334,16 @@ model:
 # not this epoch-based loop.
 # ----------------------------------------------------------------------
 training:
-  epochs: 100
+  epochs: 100                           # epochs of samples_per_epoch patches
   batch_size: 32
+  samples_per_epoch: null               # random patches per epoch; null = one per training scene (tiny epochs: a few steps each). e.g. 1024 = 32 optimiser steps at batch_size 32 -- then epochs/patience/hpo.trial_epochs count meaningful units
   micro_batch_size: null                # e.g. 8: grads accumulated over batch_size (same step), activations only for 8 -> much less VRAM; null = off
   patch_size: 256                       # must be <= the smallest tile's grid size for that sensor, or scenes get reflect-padded up to it
   lr: 0.0003
   weight_decay: 0.0001
   patience: 30                          # epochs without improvement before early stopping
+  prefetch_factor: 4                    # batches prefetched per worker (each ~180 MB at batch 32 x 256 px x 21 ch); lower = less RAM
+  val_num_workers: null                 # workers of the validation loader; null = same as num_workers (2 is plenty and saves RAM)
   num_workers: 16                       # CPU-bound data loading is the bottleneck (GPU 20-30%, CPU ~90% even at num_workers=10) -- raise toward core count minus a couple reserved for the main process, watch RAM (each worker holds its own copy of every loaded scene)
   seed: 0
   deterministic: false                  # true pins cuDNN to deterministic algorithms (slower, exactly reproducible)
@@ -428,20 +438,38 @@ training:
 # ----------------------------------------------------------------------
 hpo:
   trials: 0
-  trial_epochs: 25
+  val_patches_per_scene: 4              # HPO trials only (needs training.samples_per_epoch): validate on 4 fixed, evenly spaced patches of each val scene instead of all of them (null = all). The final retrain validates on everything.
+  trial_epochs: 25                      # epochs per trial (of training.samples_per_epoch patches); the winner is retrained at full training.epochs
+  cv_folds: 0                           # >= 2 (with trials > 0): score each trial on k class-balanced folds of train+val, grouped per split.split_by (less noisy, k x slower, no pruning); 0 = single configured train/val split
   sampler: tpe                          # tpe | cmaes | random
   pruner: none                          # none | median | hyperband
   storage: null                         # null = in-memory; or e.g. "sqlite:///hpo_study.db" to resume/inspect later
   search_space:
+    # Study 1 -- the six hyperparameters worth searching. Anything else (base_ch, patch_size,
+    # unet.depth, norm_type, FiLM / attention switches, augmentation) is compared by hand.
+    # Keys must be known to training/hpo.py (_TRAINING_FIELDS / _MODEL_SUBSECTION_FIELDS).
     lr:
       type: log_uniform                 # log_uniform | uniform
-      bounds: [0.00001, 0.01]
+      bounds: [0.0003, 0.003]
     weight_decay:
       type: log_uniform
       bounds: [0.000001, 0.01]
     dropout_p:
       type: uniform
-      bounds: [0.0, 0.5]
+      bounds: [0.0, 0.3]
+    focal_gamma:                        # 0 = plain cross-entropy, 2 = usual focal loss
+      type: uniform
+      bounds: [0.0, 3.0]
+    dice_weight:                        # weight of the soft-Dice term (every class counts equally)
+      type: uniform
+      bounds: [0.0, 1.0]
+    class_weight_power:                 # 0 = no class weights, 1 = plain inverse frequency, 0.5 = sqrt
+      type: uniform
+      bounds: [0.0, 1.0]
+    # Optional 7th: cap on any single class weight
+    # class_weight_max:
+    #   type: uniform
+    #   bounds: [3.0, 20.0]
 
 # ----------------------------------------------------------------------
 # Multi-seed bootstrap ensembling
@@ -494,17 +522,17 @@ composites:
   # project's own configs/classes.yaml -- adjust to your own taxonomy.
   # Raw class ids (classes.yaml `id`), not dense. Transient states fill in only
   # where nothing else won the month's majority; precedence (lower priority wins):
-  # snow > firn > ice > any other class.
+  # any other class (not cloud/shadow) > ice > firn > snow (worst state wins).
   class_rules:
     - class_id: 8   # snow_cover
       rule: fallback_occurrence
-      priority: 1
+      priority: 3
     - class_id: 16  # firn (remove this rule if classes.yaml has no firn class)
       rule: fallback_occurrence
       priority: 2
     - class_id: 9   # ice_cover
       rule: fallback_occurrence
-      priority: 3
+      priority: 1
   ignore_classes: [cloud, shadow]       # cast no vote in a month's composite (a month is decided by its clear observations); [] = they vote
   output_root: outputs/composites
   tiles: []                              # empty = every tile in the registry
@@ -672,11 +700,27 @@ event_typing:
   min_cleared_years: 3                  # not forest for this many seasons in a row (forest takes years to come back)
   permanent_years: 8.0                  # cleared, never recovered, mostly bare for this long = permanent clearing
   permanent_bare_fraction: 0.6
-  crop_season: [5, 10]                  # months (May-October) bare and grass must roll through
-  crop_min_months_per_year: 2           # observed months of EACH of bare and grass in that season = a cycling year
-  crop_min_run_years: 4                 # cycling EVERY observed year from its first year to the end of the series, for at least this many years = cropland
-  crop_allowed_gaps: 0                  # observed years allowed not to cycle (0 = strictly every year)
-  crop_max_forest_fraction: 0.0         # forest share allowed from the start year on (0 = never forest again)
+  crop_season: [6, 9]                   # months (June-September): May / October leaf-off woodland and any grass read as open or bare
+  crop_min_run_years: 8                 # open (grass/bare) every observed year from its first open year to the end, for at least this many years
+  crop_max_forest_fraction: 0.2         # share of closed months (forest, wetland, water, burned) allowed in that run
+  crop_open_fraction: 0.8               # open share of a season's months for it to count as an open year
+  crop_min_bare_fraction: 0.03          # bare share of the run = the land is worked (0 = pasture counts too)
+  crop_min_bare_year_fraction: 0.15     # share of the open years that show bare ground (worked every few years; a regrowing cutblock is bare only at the start)
+  crop_end_gap_years: 2                 # the open run may stop this many years before the series end (classifier drift); more = trees, not a field
+  crop_since_start_years: 1             # open from the first year(s) of the series = old farmland / hay: no bare ground needed
+  cleared_gap_seasons: 1                # noisy seasons (a little forest) tolerated inside a cutblock clearing
+  crop_min_patch_px: 300                # a field patch has at least this many pixels (3 ha at 10 m)
+  crop_min_width_px: 5                  # thinner strips (roads, pads, lines) are not fields
+  pre_min_fraction: 0.5                 # forest share of a "before" season (mixed / young stands are thinner than min_fraction)
+  fire_season: [6, 8]                   # months (June-August) a fire can be dated in; dry soil / autumn colour read as burned outside it
+  object_fire_min_pixels: 2000          # a same-year patch this big (2000 px = 20 ha at 10 m) can be retyped as one fire...
+  object_fire_burned: 0.10              # ... if its mean burned share is at least this
+  object_fire_dnbr: 0.45                # ... or its mean NBR fall is at least this, with object_fire_dnbr_burned burned
+  object_fire_dnbr_burned: 0.05
+  object_fire_local_burned: 0.03        # inside a fire patch, a pixel needs this burned share around it (a clean cutblock touching a burn stays a cutblock)
+  linear_max_width_px: 3                # strips narrower than this and >= linear_min_extent_px long = linear_feature (road/seismic line)
+  linear_min_extent_px: 15
+  linear_gap_px: 3                      # holes up to this wide in a dotted track still join its dashes
 
 # ----------------------------------------------------------------------
 # Vegetation dynamics (script 14): what the vegetation does BETWEEN breaks.
@@ -690,6 +734,7 @@ vegetation_dynamics:
   tiles: []                             # empty = every tile in the registry
   overwrite: false
   workers: 4                            # tiles in parallel; memory per worker = the yearly output arrays (a few hundred MB per 8 km tile)
+  cube_workers: 1                       # max tiles at once in the heavy phase (reading class composites + scenes, writing the monthly cube: SSD-bound); others wait their turn, then compute in parallel
   month_threads: 4                      # months of the cube built ahead in threads inside a tile (1 = sequential)
   block_rows: 64                        # rows per block of the per-pixel pass (smaller = less RAM)
   indices: [NDVI]                       # one cube + one set of outputs per index (NBR also possible; costs disk and time)
@@ -731,7 +776,7 @@ recovery_analysis:
   output_root: outputs/recovery_analysis
   overwrite: false
   index: NDVI                           # must be in vegetation_dynamics.indices
-  event_types: [fire, cutblock, permanent_clearing, canopy_decline, other_loss]   # from event_typing (gain is left out)
+  event_types: [fire, cutblock, permanent_clearing, canopy_decline, other_loss, recent_clearing, linear_feature, open_land_disturbance, regrowth_change, cropland_change]   # from event_typing (gain is left out)
   curves:
     enabled: true                       # yearly index after each event relative to the pre-event baseline; recovery time, trough, rate
     max_years: 20                       # years after the break year kept in the curve
@@ -776,6 +821,7 @@ feature_importance:
     chromaticity(r,g,b): [r, g, b]
     tasseled_cap: [TC_BRIGHTNESS, TC_GREENNESS, TC_WETNESS]
     dem(elevation,slope): [elevation, slope]
+    aspect(sin,cos): [aspect_sin, aspect_cos]
     doy(sin,cos): [doy_sin, doy_cos]
     swir_indices: [NDSI, NDWI_GAO, NBR, ND_SWIR1_SWIR2]
     blue/green_ratios: [ND_BLUE_RED, ND_BLUE_NIR, ND_GREEN_RED]

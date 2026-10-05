@@ -129,6 +129,27 @@ MODEL_INDEX_NAMES: tuple[str, ...] = (*INDEX_NAMES, *TASSELED_CAP_INDICES)
 #: dem/grid_check.py's exact-match invariant).
 DEM_LAYER_NAMES: tuple[str, ...] = ("elevation", "slope", "aspect")
 
+#: Model-input channels a DEM layer expands to. ``aspect`` is circular (359 deg
+#: is next to 1 deg) and NaN on flat cells, so it enters the model as
+#: sin/cos with flat cells at 0 -- a raw-degrees channel would both break at the
+#: wrap and make every flat pixel (lakes, plains) non-finite, i.e. nodata at inference.
+DEM_LAYER_CHANNELS: dict[str, tuple[str, ...]] = {"aspect": ("aspect_sin", "aspect_cos")}
+
+
+def expand_dem_feature_names(dem_layer_names) -> tuple[str, ...]:
+    """Feature-channel names for ``dem_layer_names`` (``aspect`` -> sin/cos pair)."""
+    return tuple(c for name in dem_layer_names for c in DEM_LAYER_CHANNELS.get(name, (name,)))
+
+
+def dem_layer_to_channels(name: str, array: np.ndarray) -> list[np.ndarray]:
+    """The ``(H, W)`` float32 channel(s) one DEM layer contributes to the stack."""
+    array = np.asarray(array, dtype=np.float32)
+    if name == "aspect":
+        angle = np.deg2rad(array)
+        return [np.nan_to_num(np.sin(angle), nan=0.0), np.nan_to_num(np.cos(angle), nan=0.0)]
+    return [array]
+
+
 #: Acquisition-date channels: cyclical day-of-year encoding, so the model
 #: sees seasonality directly (e.g. bare/snow-covered ground reads very
 #: differently in winter vs. summer under the same land-cover class) instead
@@ -162,6 +183,21 @@ def doy_cyclical_stack(acquisition_date, shape: tuple[int, int]) -> np.ndarray:
     )
 
 
+def centroid_latlon_norm(transform, crs, shape: tuple[int, int]) -> tuple[np.float32, np.float32]:
+    """``(lat/90, lon/180)`` of the grid's centroid (``transform``/``crs`` = the scene grid)."""
+    from affine import Affine
+    from pyproj import Transformer
+    from rasterio.crs import CRS
+
+    h, w = shape
+    aff = transform if isinstance(transform, Affine) else Affine(*transform[:6])
+    center_x, center_y = aff * (w / 2.0, h / 2.0)
+
+    transformer = Transformer.from_crs(CRS.from_user_input(crs), "EPSG:4326", always_xy=True)
+    lon, lat = transformer.transform(center_x, center_y)
+    return np.float32(lat / 90.0), np.float32(lon / 180.0)
+
+
 def latlon_stack(
     transform,
     crs: str,
@@ -178,20 +214,7 @@ def latlon_stack(
     georeferencing (see ``features.training_cache.build_feature_stack``'s
     own ``dst_transform``/``dst_crs``).
     """
-    from affine import Affine
-    from pyproj import Transformer
-    from rasterio.crs import CRS
-
-    h, w = shape
-    aff = transform if isinstance(transform, Affine) else Affine(*transform[:6])
-    center_x, center_y = aff * (w / 2.0, h / 2.0)
-
-    src_crs = CRS.from_user_input(crs)
-    transformer = Transformer.from_crs(src_crs, "EPSG:4326", always_xy=True)
-    lon, lat = transformer.transform(center_x, center_y)
-
-    lat_norm = np.float32(lat / 90.0)
-    lon_norm = np.float32(lon / 180.0)
+    lat_norm, lon_norm = centroid_latlon_norm(transform, crs, shape)
     return np.stack(
         [np.full(shape, lat_norm, dtype=np.float32), np.full(shape, lon_norm, dtype=np.float32)],
         axis=0,

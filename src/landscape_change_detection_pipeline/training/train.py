@@ -35,19 +35,20 @@ apply strongly enough here to justify leaving it off.
 from __future__ import annotations
 
 import copy
+import functools
 import math
 import os
 import random
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.amp import GradScaler, autocast
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, get_worker_info
 
 from landscape_change_detection_pipeline.config import (
     ModelConfig,
@@ -197,9 +198,14 @@ class PatchDataset(Dataset):
         seed: int = 0,
         scene_weights: Optional[list[float]] = None,
         scene_loss_weight: float = 1.0,
+        aspect_channels: Optional[tuple[int, int]] = None,
     ) -> None:
         if not records:
             raise ValueError("PatchDataset requires at least one scene record")
+
+        #: Indices of the ``aspect_sin`` / ``aspect_cos`` channels (east / north
+        #: component of the downslope direction), turned with the patch below.
+        self.aspect_channels = aspect_channels
 
         self.patch_size = int(patch_size)
         self.mean = mean.astype(np.float32).reshape(-1, 1, 1)
@@ -211,6 +217,7 @@ class PatchDataset(Dataset):
         self.scene_loss_weight = float(scene_loss_weight)
         self._rng = random.Random(seed)
         self._noise_rng = np.random.default_rng(seed)
+        self._worker_seed: Optional[int] = None
 
         # Kept at the cache's own dtype (float16 features, uint8/int labels)
         # rather than upcast to float32/int64 here -- every DataLoader
@@ -224,7 +231,9 @@ class PatchDataset(Dataset):
         # pickled to each Windows DataLoader worker only holds the records,
         # and the OS page cache is shared by all workers, so RAM no longer
         # scales with corpus size or num_workers.
-        self.scenes = _LazyScenes(sorted(records, key=lambda r: r.sort_key), self.patch_size)
+        sorted_records = sorted(records, key=lambda r: r.sort_key)
+        self.scenes = _LazyScenes(sorted_records, self.patch_size)
+        self._contexts = _scene_contexts(sorted_records)
         self._num_scenes = len(self.scenes)
 
         if scene_weights is not None:
@@ -243,6 +252,20 @@ class PatchDataset(Dataset):
 
     def __len__(self) -> int:
         return self.epoch_length
+
+    def _reseed_for_worker(self) -> None:
+        """Give each DataLoader worker its own random stream.
+
+        The dataset (with its ``random.Random`` / numpy generator already seeded) is
+        copied into every worker, so without this all workers draw the *same* patches,
+        flips and noise. ``info.seed`` differs per worker (and per iterator for
+        non-persistent workers), and is reproducible from the training seed.
+        """
+        info = get_worker_info()
+        if info is not None and info.seed != self._worker_seed:
+            self._worker_seed = info.seed
+            self._rng = random.Random(info.seed)
+            self._noise_rng = np.random.default_rng(info.seed)
 
     def _draw_scene_index(self) -> int:
         if self._scene_cum_weights is None:
@@ -291,7 +314,8 @@ class PatchDataset(Dataset):
 
         return np.concatenate([spectral.astype(np.float32), rest], axis=0)
 
-    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        self._reseed_for_worker()
         scene_index = self._draw_scene_index()
         features, labels = self.scenes[scene_index]
 
@@ -306,18 +330,22 @@ class PatchDataset(Dataset):
         patch_features = features[:, y0 : y0 + self.patch_size, x0 : x0 + self.patch_size]
         patch_labels = labels[y0 : y0 + self.patch_size, x0 : x0 + self.patch_size]
 
+        flip_x = flip_y = False
+        rot_k = 0
         if self.augment_flips:
             if self._rng.random() < 0.5:
+                flip_x = True
                 patch_features = patch_features[:, :, ::-1]
                 patch_labels = patch_labels[:, ::-1]
             if self._rng.random() < 0.5:
+                flip_y = True
                 patch_features = patch_features[:, ::-1, :]
                 patch_labels = patch_labels[::-1, :]
         if self.augment_rotate90:
-            k = self._rng.randrange(4)
-            if k:
-                patch_features = np.rot90(patch_features, k, axes=(1, 2))
-                patch_labels = np.rot90(patch_labels, k, axes=(0, 1))
+            rot_k = self._rng.randrange(4)
+            if rot_k:
+                patch_features = np.rot90(patch_features, rot_k, axes=(1, 2))
+                patch_labels = np.rot90(patch_labels, rot_k, axes=(0, 1))
 
         # Cast off the cache's storage dtype (float16/uint8) here, on the
         # small patch rather than the full scene -- see this class's
@@ -326,6 +354,14 @@ class PatchDataset(Dataset):
         # arithmetic below.
         patch_features = np.ascontiguousarray(patch_features, dtype=np.float32)
         patch_labels = np.ascontiguousarray(patch_labels, dtype=np.int64)
+
+        if self.aspect_channels is not None and (flip_x or flip_y or rot_k):
+            # The slope direction must follow the geometry: aspect_sin = east and
+            # aspect_cos = north component of the downslope direction (north-up grid).
+            i_east, i_north = self.aspect_channels
+            patch_features[i_east], patch_features[i_north] = _transform_downslope(
+                patch_features[i_east], patch_features[i_north], flip_x, flip_y, rot_k
+            )
 
         # Radiometric jitter runs on raw (pre-normalization) feature values,
         # in the same units channel mean/std were computed over, so
@@ -346,7 +382,21 @@ class PatchDataset(Dataset):
             torch.from_numpy(normalized.astype(np.float32)),
             torch.from_numpy(patch_labels.astype(np.int64)),
             torch.tensor(self.scene_loss_weight, dtype=torch.float32),
+            self._contexts[scene_index],
         )
+
+
+def _transform_downslope(east, north, flip_x: bool, flip_y: bool, rot_k: int):
+    """(east, north) components of the downslope direction after the patch was
+    mirrored left-right (``flip_x``), up-down (``flip_y``) and rotated ``rot_k``
+    x 90 deg counter-clockwise (``np.rot90``), on a north-up grid."""
+    if flip_x:
+        east = -east
+    if flip_y:
+        north = -north
+    for _ in range(rot_k % 4):
+        east, north = -north, east
+    return east, north
 
 
 class GridPatchDataset(Dataset):
@@ -377,6 +427,7 @@ class GridPatchDataset(Dataset):
         std: np.ndarray,
         patch_size: int,
         stride: Optional[int] = None,
+        max_patches_per_scene: Optional[int] = None,
     ) -> None:
         if not records:
             raise ValueError("GridPatchDataset requires at least one scene record")
@@ -387,20 +438,25 @@ class GridPatchDataset(Dataset):
         self.std = np.maximum(std.astype(np.float32), 1e-6).reshape(-1, 1, 1)
 
         # Memory-mapped on demand, like PatchDataset (see _LazyScenes).
-        self.scenes = _LazyScenes(sorted(records, key=lambda r: r.sort_key), self.patch_size)
+        sorted_records = sorted(records, key=lambda r: r.sort_key)
+        self.scenes = _LazyScenes(sorted_records, self.patch_size)
+        self._contexts = _scene_contexts(sorted_records)
         self._index: list[tuple[int, int, int]] = []  # (scene_index, y0, x0)
         for scene_index in range(len(self.scenes)):
             _, height, width = self.scenes[scene_index][0].shape
             ys = list(range(0, height - self.patch_size, self.stride)) + [height - self.patch_size]
             xs = list(range(0, width - self.patch_size, self.stride)) + [width - self.patch_size]
-            for y0 in sorted(set(ys)):
-                for x0 in sorted(set(xs)):
-                    self._index.append((scene_index, y0, x0))
+            scene_cells = [(scene_index, y0, x0) for y0 in sorted(set(ys)) for x0 in sorted(set(xs))]
+            if max_patches_per_scene and len(scene_cells) > max_patches_per_scene:
+                # Evenly spaced cells, the same ones every epoch (cheap AND comparable across trials).
+                keep = np.linspace(0, len(scene_cells) - 1, int(max_patches_per_scene)).round().astype(int)
+                scene_cells = [scene_cells[i] for i in sorted(set(keep.tolist()))]
+            self._index.extend(scene_cells)
 
     def __len__(self) -> int:
         return len(self._index)
 
-    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         scene_index, y0, x0 = self._index[index]
         features, labels = self.scenes[scene_index]
 
@@ -413,7 +469,16 @@ class GridPatchDataset(Dataset):
             torch.from_numpy(normalized.astype(np.float32)),
             torch.from_numpy(patch_labels.astype(np.int64)),
             torch.tensor(1.0, dtype=torch.float32),
+            self._contexts[scene_index],
         )
+
+
+def _scene_contexts(records: list[SceneRecord]) -> list[torch.Tensor]:
+    """One ``(CONTEXT_DIM,)`` FiLM context per scene (see ``features/scene_context.py``).
+    Always built: it is a few floats per scene, and models that do not use it ignore it."""
+    from landscape_change_detection_pipeline.features.scene_context import record_context
+
+    return [torch.from_numpy(record_context(r)) for r in records]
 
 
 class _LazyScenes:
@@ -515,12 +580,14 @@ def checkpoint_metadata(
         "unet": {
             "base_ch": unet_cfg.base_ch,
             "dropout_p": unet_cfg.dropout_p,
-            "use_spatial_context": unet_cfg.use_spatial_context,
-            "use_sensor_film": unet_cfg.use_sensor_film,
+            "film_sensor": unet_cfg.film_sensor,
+            "film_doy": unet_cfg.film_doy,
+            "film_latlon": unet_cfg.film_latlon,
             "norm_type": unet_cfg.norm_type,
             "bottleneck_attention": unet_cfg.bottleneck_attention,
             "bottleneck_attention_heads": unet_cfg.bottleneck_attention_heads,
             "deep_supervision": unet_cfg.deep_supervision,
+            "depth": unet_cfg.depth,
         }
         if model_cfg.type == "unet"
         else None,
@@ -571,13 +638,15 @@ def rebuild_model_from_checkpoint(checkpoint: dict[str, Any]) -> nn.Module:
             num_classes=meta["num_classes"],
             base_ch=cfg["base_ch"],
             dropout_p=cfg["dropout_p"],
-            use_spatial_context=cfg["use_spatial_context"],
             num_sensors=meta["num_sensors"],
-            use_sensor_film=cfg["use_sensor_film"],
+            film_sensor=cfg.get("film_sensor", False),
+            film_doy=cfg.get("film_doy", False),
+            film_latlon=cfg.get("film_latlon", False),
             norm_type=cfg["norm_type"],
             bottleneck_attention=cfg["bottleneck_attention"],
             bottleneck_attention_heads=cfg["bottleneck_attention_heads"],
             deep_supervision=cfg["deep_supervision"],
+            depth=cfg.get("depth", 4),
         )
     elif model_type == "deeplabv3plus":
         cfg = meta["deeplabv3plus"]
@@ -618,6 +687,8 @@ def _build_loaders(
     class_counts: Optional[np.ndarray] = None,
     pseudo_label_records: Optional[list[SceneRecord]] = None,
     full_val: bool = True,
+    feature_names: Optional[Sequence[str]] = None,
+    val_patches_per_scene: Optional[int] = None,
 ) -> tuple[DataLoader, DataLoader]:
     """Build the train/val ``DataLoader``s.
 
@@ -643,6 +714,10 @@ def _build_loaders(
     (the winning config, retrained at full length) gets the full grid.
     """
     from torch.utils.data import ConcatDataset
+
+    aspect_channels = None
+    if feature_names is not None and "aspect_sin" in feature_names and "aspect_cos" in feature_names:
+        aspect_channels = (list(feature_names).index("aspect_sin"), list(feature_names).index("aspect_cos"))
 
     scene_weights = None
     if config.scene_oversampling.enabled and class_counts is not None:
@@ -674,6 +749,8 @@ def _build_loaders(
         num_spectral_channels=num_spectral_channels,
         seed=config.seed,
         scene_weights=scene_weights,
+        aspect_channels=aspect_channels,
+        epoch_length=config.samples_per_epoch,
     )
 
     if config.pseudo_label.enabled and pseudo_label_records:
@@ -686,9 +763,12 @@ def _build_loaders(
             augment_rotate90=config.augment_rotate90,
             radiometric_augmentation=config.radiometric_augmentation,
             num_spectral_channels=num_spectral_channels,
-            epoch_length=max(1, round(len(train_records) * config.pseudo_label.pseudo_label_weight)),
+            epoch_length=max(
+                1, round((config.samples_per_epoch or len(train_records)) * config.pseudo_label.pseudo_label_weight)
+            ),
             seed=config.seed + 1,
             scene_loss_weight=config.pseudo_label.pseudo_label_loss_weight,
+            aspect_channels=aspect_channels,
         )
         train_dataset = ConcatDataset([train_dataset, pseudo_dataset])
 
@@ -699,6 +779,7 @@ def _build_loaders(
             mean,
             std,
             patch_size=config.patch_size,
+            max_patches_per_scene=val_patches_per_scene,
         )
     else:
         val_dataset = PatchDataset(
@@ -711,17 +792,39 @@ def _build_loaders(
             seed=config.seed,
         )
 
-    loader_kwargs: dict[str, Any] = {
-        "num_workers": config.num_workers,
-        "pin_memory": device.type == "cuda",
-    }
-    if config.num_workers > 0:
-        loader_kwargs["persistent_workers"] = True
-        loader_kwargs["prefetch_factor"] = 4
+    def loader_kwargs(num_workers: int) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {"num_workers": num_workers, "pin_memory": device.type == "cuda"}
+        if num_workers > 0:
+            kwargs["persistent_workers"] = True
+            kwargs["prefetch_factor"] = config.prefetch_factor
+        return kwargs
 
-    train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, **loader_kwargs)
-    val_loader = DataLoader(val_dataset, batch_size=config.batch_size, shuffle=False, **loader_kwargs)
+    val_workers = config.num_workers if config.val_num_workers is None else config.val_num_workers
+    train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True,
+                              **loader_kwargs(config.num_workers))
+    val_loader = DataLoader(val_dataset, batch_size=config.batch_size, shuffle=False,
+                            **loader_kwargs(val_workers))
     return train_loader, val_loader
+
+
+def _close_loader(loader: DataLoader) -> None:
+    """Stop a loader's persistent worker processes now instead of whenever the garbage
+    collector gets to them -- an HPO run builds two loaders per trial, and each worker is a
+    full Python process holding its own prefetched batches."""
+    iterator = getattr(loader, "_iterator", None)
+    if iterator is not None:
+        try:
+            iterator._shutdown_workers()
+        except Exception:  # noqa: BLE001 -- best-effort cleanup
+            pass
+        loader._iterator = None
+
+
+def _forward(model: nn.Module, x: torch.Tensor, context: torch.Tensor, **kwargs):
+    """``model(x)``, passing the scene ``context`` only to a model that uses it (FiLM)."""
+    if getattr(_unwrap(model), "uses_scene_context", False):
+        return model(x, context=context, **kwargs)
+    return model(x, **kwargs)
 
 
 @torch.inference_mode()
@@ -749,12 +852,13 @@ def evaluate(
     total_items = 0
     confusion = torch.zeros((num_classes, num_classes), dtype=torch.int64, device=device)
 
-    for x, y, _sample_weight in loader:
+    for x, y, _sample_weight, context in loader:
         x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
+        context = context.to(device, non_blocking=True)
 
         with autocast(device_type=device.type, enabled=use_amp and device.type == "cuda"):
-            logits = model(x)
+            logits = _forward(model, x, context)
             loss = weighted_cross_entropy(logits.float(), y, class_weights)
 
         total_loss += float(loss.item()) * x.size(0)
@@ -768,7 +872,7 @@ def evaluate(
     return mean_loss, confusion.cpu().numpy()
 
 
-def train_model(
+def _train_model(
     config: TrainingConfig,
     model_cfg: ModelConfig,
     train_records: list[SceneRecord],
@@ -785,6 +889,8 @@ def train_model(
     trial: Optional[Any] = None,
     num_spectral_channels: Optional[int] = None,
     pseudo_label_records: Optional[list[SceneRecord]] = None,
+    val_patches_per_scene: Optional[int] = None,
+    _loaders: Optional[list] = None,
 ) -> TrainingResult:
     """Train one torch model (unet/deeplabv3plus/segformer) end to end.
 
@@ -828,6 +934,12 @@ def train_model(
             f"(threshold/random_forest/catboost fit via their own build_<name>().fit(), not this loop)"
         )
 
+    if model_cfg.type == "unet" and config.patch_size % (2 ** (model_cfg.unet.depth - 1)) != 0:
+        raise ValueError(
+            f"training.patch_size={config.patch_size} must be divisible by "
+            f"2**(unet.depth-1)={2 ** (model_cfg.unet.depth - 1)}"
+        )
+
     resolved_device = resolve_device(device)
     seed_everything(config.seed, deterministic=config.deterministic)
 
@@ -847,8 +959,14 @@ def train_model(
         num_spectral_channels=num_spectral_channels,
         class_counts=class_counts,
         pseudo_label_records=pseudo_label_records,
-        full_val=trial is None,
+        # An HPO trial scores val on one random patch per scene -- unless epochs are big enough
+        # (samples_per_epoch set) that scoring every val pixel each epoch is a small overhead.
+        full_val=trial is None or config.samples_per_epoch is not None,
+        feature_names=feature_names,
+        val_patches_per_scene=val_patches_per_scene,
     )
+    if _loaders is not None:
+        _loaders.extend([train_loader, val_loader])
 
     model = build_model(model_cfg, in_channels=in_channels, num_classes=num_classes, num_sensors=num_sensors)
     model = model.to(resolved_device)
@@ -893,10 +1011,11 @@ def train_model(
         running_loss = 0.0
         seen = 0
 
-        for x, y, sample_weight in train_loader:
+        for x, y, sample_weight, context in train_loader:
             x = x.to(resolved_device, non_blocking=True)
             y = y.to(resolved_device, non_blocking=True)
             sample_weight = sample_weight.to(resolved_device, non_blocking=True)
+            context = context.to(resolved_device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
 
@@ -906,9 +1025,12 @@ def train_model(
             loss_total = 0.0
             for start in chunk_ids:
                 xc, yc, wc = x[start:start + step], y[start:start + step], sample_weight[start:start + step]
+                cc = context[start:start + step]
                 frac = xc.size(0) / x.size(0)
                 with autocast(device_type=resolved_device.type, enabled=use_amp):
-                    output = model(xc, return_aux=True) if supports_deep_supervision else model(xc)
+                    output = (
+                        _forward(model, xc, cc, return_aux=True) if supports_deep_supervision else _forward(model, xc, cc)
+                    )
                     logits, aux_logits = output if supports_deep_supervision else (output, [])
 
                     logits_f32 = logits.float()
@@ -1026,3 +1148,15 @@ def train_model(
         stopped_epoch=last_epoch,
         metrics=metrics,
     )
+
+
+@functools.wraps(_train_model)
+def train_model(*args, **kwargs) -> TrainingResult:
+    """See :func:`_train_model`. Always shuts the DataLoader workers down on exit
+    (normal end, early stop, an Optuna prune or an error)."""
+    loaders: list = []
+    try:
+        return _train_model(*args, _loaders=loaders, **kwargs)
+    finally:
+        for loader in loaders:
+            _close_loader(loader)

@@ -74,7 +74,8 @@ def _decimate(array: np.ndarray) -> tuple[np.ndarray, int]:
 
 # ── Labels (English) ──────────────────────────────────────────────────────────
 #: Event types (order of ``event_typing.EVENT_NAMES``).
-EVENT_LABELS = ("None", "Fire", "Cutblock", "Permanent clearing", "Canopy decline", "Other loss", "Gain")
+EVENT_LABELS = ("None", "Fire", "Cutblock", "Permanent clearing", "Canopy decline", "Other loss", "Gain",
+                "Recent clearing", "Linear feature", "Open land disturbance", "Regrowth change", "Cropland change")
 
 
 def type_label(product: str) -> str:

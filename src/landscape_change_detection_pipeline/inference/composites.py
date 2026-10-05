@@ -297,7 +297,12 @@ def build_monthly_composite(
     height, width = stack.shape[1:]
 
     counts = _per_class_vote_counts(stack, num_classes, nodata)
-    votes_valid = counts.sum(axis=0)
+    # Fallback (snow/firn/ice) votes never take part in the median: "any other
+    # class" present in the month beats them, however few scenes show it. They
+    # are excluded from the majority denominator, so a pixel is only left to
+    # them when no other class won.
+    fallback_ids = [c for c in range(num_classes) if class_rules.get(c, (default_rule, 0))[0] == "fallback_occurrence"]
+    votes_valid = counts.sum(axis=0) - counts[fallback_ids].sum(axis=0) if fallback_ids else counts.sum(axis=0)
 
     any_occurrence_hits: list[tuple[int, int, np.ndarray]] = []  # (priority, class_id, mask)
     fallback_occurrence_hits: list[tuple[int, int, np.ndarray]] = []  # (priority, class_id, mask)
@@ -330,6 +335,7 @@ def build_monthly_composite(
     # snow/ice observation must not mask a real land-cover class that a
     # majority of the month's scenes actually agree on).
     unresolved = median_winner < 0
+    # Worst state wins: priority 1 (ice) is written last, then firn, then snow.
     for priority, class_id, mask in sorted(fallback_occurrence_hits, key=lambda t: -t[0]):
         composite = np.where(unresolved & mask, class_id, composite).astype(np.uint8)
 

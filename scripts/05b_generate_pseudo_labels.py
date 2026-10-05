@@ -98,11 +98,9 @@ def main(argv: list[str] | None = None) -> int:
     from landscape_change_detection_pipeline.config import resolved_feature_names
 
     index_names, dem_layer_names = resolved_feature_names(config.features)
-    expected = [
-        *index_names, *dem_layer_names,
-        *(("doy_sin", "doy_cos") if config.features.include_doy_features else ()),
-        *(("lat_norm", "lon_norm") if config.features.include_latlon_features else ()),
-    ]
+    from landscape_change_detection_pipeline.config import all_resolved_feature_names
+
+    expected = list(all_resolved_feature_names(config.features))
     if list(feature_names) != expected:
         print(
             "[pseudo-label] WARNING: checkpoint feature_names do not match the current "

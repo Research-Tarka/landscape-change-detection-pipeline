@@ -65,7 +65,9 @@ from landscape_change_detection_pipeline.change.landcover_persistence import (  
 from landscape_change_detection_pipeline.change.event_typing import (  # noqa: E402
     EVENT_NAMES,
     change_events_output_path,
+    apply_cropland_to_events,
     detect_cropland,
+    refine_events_by_object,
     type_change_events,
     write_change_events,
 )
@@ -94,7 +96,9 @@ def _type_events(tile_id: str, composites_root: str, all_months: list, segments_
         segments_result["crs_wkt"], segments_result["shape"],
     )
     events = type_change_events(segments_result, stack, event_args["class_ids"], event_args["masked_ids"], event_args["params"])
+    events = refine_events_by_object(events, event_args["params"])
     cropland = detect_cropland(stack, event_args["class_ids"], event_args["masked_ids"], event_args["params"])
+    events = apply_cropland_to_events(events, cropland, segments_result["shape"])
     write_change_events(out_path, events, cropland, segments_result)
     counts = {EVENT_NAMES[c]: int((events["event_type"] == c).sum()) for c in range(1, len(EVENT_NAMES))}
     print(f"[change_events] {tile_id}: {counts}, cropland pixels {len(cropland['row'])} -> {out_path}", flush=True)
@@ -207,9 +211,17 @@ def main(argv: list[str] | None = None) -> int:
             min_season_obs=ev_cfg.min_season_obs, pre_seasons=ev_cfg.pre_seasons,
             min_cleared_years=ev_cfg.min_cleared_years, permanent_years=ev_cfg.permanent_years,
             permanent_bare_fraction=ev_cfg.permanent_bare_fraction, crop_season=tuple(ev_cfg.crop_season),
-            crop_min_months_per_year=ev_cfg.crop_min_months_per_year,
             crop_min_run_years=ev_cfg.crop_min_run_years, crop_max_forest_fraction=ev_cfg.crop_max_forest_fraction,
-            crop_allowed_gaps=ev_cfg.crop_allowed_gaps,
+            crop_open_fraction=ev_cfg.crop_open_fraction, crop_min_bare_fraction=ev_cfg.crop_min_bare_fraction,
+            crop_min_bare_year_fraction=ev_cfg.crop_min_bare_year_fraction,
+            crop_end_gap_years=ev_cfg.crop_end_gap_years,
+            crop_since_start_years=ev_cfg.crop_since_start_years, fire_season=tuple(ev_cfg.fire_season), cleared_gap_seasons=ev_cfg.cleared_gap_seasons,
+            crop_min_patch_px=ev_cfg.crop_min_patch_px, crop_min_width_px=ev_cfg.crop_min_width_px,
+            linear_gap_px=ev_cfg.linear_gap_px, pre_min_fraction=ev_cfg.pre_min_fraction,
+            object_fire_min_pixels=ev_cfg.object_fire_min_pixels, object_fire_burned=ev_cfg.object_fire_burned,
+            object_fire_dnbr=ev_cfg.object_fire_dnbr, object_fire_dnbr_burned=ev_cfg.object_fire_dnbr_burned,
+            object_fire_local_burned=ev_cfg.object_fire_local_burned,
+            linear_max_width_px=ev_cfg.linear_max_width_px, linear_min_extent_px=ev_cfg.linear_min_extent_px,
         ),
     )
 

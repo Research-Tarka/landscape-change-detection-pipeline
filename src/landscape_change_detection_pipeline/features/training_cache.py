@@ -47,12 +47,15 @@ import numpy as np
 from landscape_change_detection_pipeline.classes.class_config import ClassConfig
 from landscape_change_detection_pipeline.dem.zarr_store import read_tile_dem
 from landscape_change_detection_pipeline.features.spectral_indices import (
+    DEM_LAYER_CHANNELS,
     DEM_LAYER_NAMES,
     DOY_FEATURE_NAMES,
     INDEX_NAMES,
     LATLON_FEATURE_NAMES,
     compute_indices,
+    dem_layer_to_channels,
     doy_cyclical_stack,
+    expand_dem_feature_names,
     latlon_stack,
 )
 from landscape_change_detection_pipeline.scenes.band_specs import get_band_spec
@@ -416,13 +419,14 @@ def build_feature_stack(
             dem_provenance.append("resampled_for_alignment")
         else:
             dem_provenance.append("native")
-        dem_arrays.append(arr)
+        dem_arrays.extend(dem_layer_to_channels(name, arr))
+        dem_provenance.extend([dem_provenance.pop()] * len(DEM_LAYER_CHANNELS.get(name, (name,))))
     dem_stack = np.stack(dem_arrays, axis=0).astype(np.float32) if dem_arrays else np.zeros(
         (0, *index_stack.shape[1:]), dtype=np.float32
     )
 
     stacks = [index_stack, dem_stack]
-    feature_names = [*index_names, *dem_layer_names]
+    feature_names = [*index_names, *expand_dem_feature_names(dem_layer_names)]
     feature_provenance = [*index_provenance, *dem_provenance]
 
     if include_doy_features:
@@ -638,7 +642,7 @@ def export_annotated_scene(
     cache_dir = Path(train_root) / scene.tile_id / scene.sensor / scene.scene_id
     feature_names = [
         *index_names,
-        *dem_layer_names,
+        *expand_dem_feature_names(dem_layer_names),
         *(DOY_FEATURE_NAMES if include_doy_features else ()),
         *(LATLON_FEATURE_NAMES if include_latlon_features else ()),
     ]

@@ -171,8 +171,13 @@ def predict_scene(
     priority_order: tuple[int, ...] = (),
     nodata: int = 255,
     use_amp: bool = False,
+    context: Optional[np.ndarray] = None,
 ):
     """Run sliding-window inference over a full scene.
+
+    ``context`` is the scene's ``(CONTEXT_DIM,)`` FiLM vector
+    (``features.scene_context.scene_context_vector``); required when the model
+    has FiLM on (``model.uses_scene_context``), ignored otherwise.
 
     ``use_amp`` runs the forward pass under CUDA fp16 autocast (softmax stays
     fp32) -- noticeably faster on GPU, at a negligible cost in probability
@@ -219,6 +224,13 @@ def predict_scene(
 
     model.eval()
     model_device = next(model.parameters()).device
+    depth = getattr(model, "depth", None)
+    if depth is not None and patch_size % (2 ** (depth - 1)) != 0:
+        raise ValueError(f"inference patch_size={patch_size} must be divisible by 2**(depth-1)={2 ** (depth - 1)}")
+    uses_context = bool(getattr(model, "uses_scene_context", False))
+    if uses_context and context is None:
+        raise ValueError("this model uses scene context (FiLM): pass `context=scene_context_vector(...)`")
+    context_row = None if context is None else torch.as_tensor(np.asarray(context, dtype=np.float32))
 
     with torch.inference_mode():
         for start in range(0, len(positions), batch_size):
@@ -229,7 +241,11 @@ def predict_scene(
             )
             tensor = torch.from_numpy(batch).to(model_device)
             with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp and tensor.is_cuda):
-                logits = model(tensor)
+                if uses_context:
+                    ctx = context_row.to(model_device).unsqueeze(0).expand(tensor.shape[0], -1)
+                    logits = model(tensor, context=ctx)
+                else:
+                    logits = model(tensor)
             probabilities = torch.softmax(logits.float(), dim=1).cpu().numpy()
 
             for (r, c), prob in zip(chunk, probabilities):

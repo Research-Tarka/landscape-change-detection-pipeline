@@ -63,6 +63,7 @@ from landscape_change_detection_pipeline.classes.class_config import (  # noqa: 
     load_class_config,
 )
 from landscape_change_detection_pipeline.config import load_config  # noqa: E402
+from landscape_change_detection_pipeline.features.scene_context import record_context  # noqa: E402
 from landscape_change_detection_pipeline.features.training_cache import load_scene_cache  # noqa: E402
 from landscape_change_detection_pipeline.training.dataset import (  # noqa: E402
     collect_class_pixel_counts_by_scene,
@@ -128,9 +129,10 @@ def _build_patches(subset, patch: int, per_scene: int, min_labelled: float, seed
     """Random (features (C,p,p) float32, labels (p,p)) patches holding at least
     ``min_labelled`` labelled pixels -- the same size the model trained on."""
     rng = np.random.default_rng(seed)
-    feats, labs = [], []
+    feats, labs, ctxs = [], [], []
     for r in subset:
         c = load_scene_cache(r.cache_dir, label_remap=r.label_remap)
+        ctx = record_context(r)
         f, lab = c["features"], c["labels"]
         h, w = lab.shape
         if h < patch or w < patch:
@@ -142,10 +144,11 @@ def _build_patches(subset, patch: int, per_scene: int, min_labelled: float, seed
             if (sl != IGNORE_INDEX).mean() >= min_labelled:
                 feats.append(f[:, y0:y0 + patch, x0:x0 + patch].astype(np.float32))
                 labs.append(sl.astype(np.int64))
+                ctxs.append(ctx)
                 got += 1
                 if got >= per_scene:
                     break
-    return feats, labs
+    return feats, labs, ctxs
 
 
 def _unet_permutation(loaded, subset, args, config, num_classes, class_names, targets):
@@ -156,7 +159,7 @@ def _unet_permutation(loaded, subset, args, config, num_classes, class_names, ta
 
     device = next(loaded.model.parameters()).device
     patch = config.training.patch_size
-    feats, labs = _build_patches(subset, patch, args.patches_per_scene, 0.2, seed=2)
+    feats, labs, ctxs = _build_patches(subset, patch, args.patches_per_scene, 0.2, seed=2)
     n = len(feats)
     if n < 2:
         raise RuntimeError("not enough labelled patches for the permutation")
@@ -165,6 +168,8 @@ def _unet_permutation(loaded, subset, args, config, num_classes, class_names, ta
     x = np.nan_to_num((np.stack(feats) - mean) / std, nan=0.0, posinf=0.0, neginf=0.0)
     x = torch.from_numpy(x).to(device=device, dtype=torch.float16)
     y = torch.from_numpy(np.stack(labs)).to(device)
+    ctx_all = torch.from_numpy(np.stack(ctxs)).to(device)
+    uses_context = bool(getattr(loaded.model, "uses_scene_context", False))
     remap = subset[0].label_remap
     remap_t = torch.as_tensor(np.asarray(remap, dtype=np.int64), device=device) if remap is not None else None
     loaded.model.eval()
@@ -180,7 +185,9 @@ def _unet_permutation(loaded, subset, args, config, num_classes, class_names, ta
                     xb = xb.clone()
                     xb[:, channels] = donor[:, channels]
                 with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=device.type == "cuda"):
-                    pred = loaded.model(xb.float() if device.type != "cuda" else xb).argmax(1)
+                    xin = xb.float() if device.type != "cuda" else xb
+                    out = loaded.model(xin, context=ctx_all[i:i + args.batch_size]) if uses_context else loaded.model(xin)
+                    pred = out.argmax(1)
                 if remap_t is not None:
                     pred = remap_t[pred]
                 t = y[i:i + args.batch_size]
