@@ -48,8 +48,13 @@ from __future__ import annotations
 import argparse
 import functools
 import json
+import os
 import sys
 from types import SimpleNamespace
+
+# Torch (libiomp5md) and CatBoost/sklearn (libomp) each ship an OpenMP runtime on Windows;
+# without this the separability step aborts the whole process (OMP Error #15).
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 from pathlib import Path
 
 import numpy as np
@@ -465,6 +470,15 @@ def main(argv: list[str] | None = None) -> int:
 
     results: dict[str, dict] = {}
     baseline = {}
+    out_dir = Path(fi.output_root)
+
+    def _save_partial(stage: str) -> None:
+        # Raw results after each method, so a late crash does not lose hours of compute.
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "feature_importance_partial.json").write_text(json.dumps({
+            "model_type": model_type, "checkpoint": str(ckpt), "split": fi.split, "stage_done": stage,
+            "baseline": baseline, "results": results,
+        }, indent=2, default=float), encoding="utf-8")
 
     if "permutation" in methods:
         print("[importance] --- permutation ---")
@@ -484,6 +498,7 @@ def main(argv: list[str] | None = None) -> int:
             )
         baseline["permutation"] = base
         results["permutation"] = perm
+        _save_partial("permutation")
 
     proxy = None
     keep_all = list(range(len(names)))
@@ -506,6 +521,7 @@ def main(argv: list[str] | None = None) -> int:
         print("[importance] SHAP (class-balanced mean |value|):")
         for i in np.argsort(-overall):
             print(f"  {names[i]:<24} {overall[i]:.4f}")
+        _save_partial("shap")
 
     if "dropcolumn" in methods:
         print("[importance] --- drop-column ---")
@@ -521,6 +537,7 @@ def main(argv: list[str] | None = None) -> int:
                                          if not (np.isnan(v) or np.isnan(p0[cn]))}]}
             print(f"[importance] [{i}/{len(targets)}] drop-column {label:<34} d_miou={out[label]['mean']:+.4f}")
         results["dropcolumn"] = out
+        _save_partial("dropcolumn")
 
     sep = None
     if "separability" in methods:
@@ -544,7 +561,6 @@ def main(argv: list[str] | None = None) -> int:
         verdict[n] = bool(votes) and all(votes)
     drops = [n for n, v in verdict.items() if v]
 
-    out_dir = Path(fi.output_root)
     npz = _write_tables(out_dir / "feature_importance.npz", names, targets, results, verdict, pairs, sep)
     (out_dir / "feature_importance.json").write_text(json.dumps({
         "model_type": model_type, "checkpoint": str(ckpt), "split": fi.split, "baseline": baseline,

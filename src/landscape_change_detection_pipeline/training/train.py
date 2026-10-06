@@ -828,6 +828,13 @@ def _forward(model: nn.Module, x: torch.Tensor, context: torch.Tensor, **kwargs)
 
 
 @torch.inference_mode()
+def _restore_buffers(model: torch.nn.Module, saved: list[torch.Tensor]) -> None:
+    """Copy ``saved`` back into the model's buffers (BatchNorm running stats etc.)."""
+    with torch.no_grad():
+        for buf, good in zip(model.buffers(), saved):
+            buf.copy_(good)
+
+
 def evaluate(
     model: nn.Module,
     loader: DataLoader,
@@ -1010,6 +1017,7 @@ def _train_model(
         model.train()
         running_loss = 0.0
         seen = 0
+        skipped_batches = 0
 
         for x, y, sample_weight, context in train_loader:
             x = x.to(resolved_device, non_blocking=True)
@@ -1018,6 +1026,10 @@ def _train_model(
             context = context.to(resolved_device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
+            # The forward pass updates BatchNorm running stats in place before we know
+            # whether the batch is finite; keep a copy so a skipped batch can't poison
+            # eval-mode statistics (weights stay finite, val_loss goes NaN).
+            good_buffers = [b.detach().clone() for b in model.buffers()]
 
             micro = config.micro_batch_size
             chunk_ids = range(0, x.size(0), micro) if micro and micro < x.size(0) else [0]
@@ -1048,14 +1060,30 @@ def _train_model(
                 loss_total += float(loss.item()) * frac
             loss = torch.tensor(loss_total)
 
+            if not math.isfinite(loss_total):
+                # A non-finite batch loss must never reach the weights: one NaN step
+                # is permanent (AdamW moments + weights stay NaN for every later epoch).
+                skipped_batches += 1
+                optimizer.zero_grad(set_to_none=True)
+                _restore_buffers(model, good_buffers)
+                continue
+
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.grad_clip_norm)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.grad_clip_norm)
+            if not torch.isfinite(grad_norm):
+                skipped_batches += 1
+                optimizer.zero_grad(set_to_none=True)
+                _restore_buffers(model, good_buffers)
+                scaler.update()
+                continue
             scaler.step(optimizer)
             scaler.update()
 
             running_loss += float(loss.item()) * x.size(0)
             seen += x.size(0)
 
+        if skipped_batches and progress:
+            print(f"[epoch {epoch}] skipped {skipped_batches} batch(es) with non-finite loss/gradient")
         train_loss = running_loss / max(seen, 1)
         val_loss, confusion = evaluate(
             model, val_loader, resolved_device, class_weights, use_amp, num_classes, pred_remap=pred_remap,
