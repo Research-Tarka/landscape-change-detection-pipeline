@@ -22,7 +22,7 @@ data/*
 !data/.gitkeep
 outputs/*
 !outputs/.gitkeep
-models/
+/models/
 *.zarr
 *.parquet
 *.tif
