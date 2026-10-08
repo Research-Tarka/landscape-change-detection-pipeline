@@ -26,6 +26,12 @@ Earth Engine, once:
 earthengine authenticate
 ```
 
+MaskForge session, once per machine (and again after any change to `configs/classes.yaml`): generate the file MaskForge opens as its session, with the shared class palette and your tiles folder.
+
+```
+python scripts/export_maskforge_palette.py     # writes configs/maskforge_session.json (gitignored)
+```
+
 ## 2. The one rule: everything goes through the config
 
 You run a script with **no options**. Every parameter (tiles, workers, thresholds, what is enabled) is read from `configs/config.yaml`, so a run can be reproduced from the config alone. A few scripts keep a flag to say *which* files to read (`--config`, `--env-file`, `--classes`), and the downloader / pseudo-labeler keep scoping flags (`--split`, `--checkpoint`...). That is all.
@@ -38,7 +44,7 @@ Two more habits shared by every stage:
 ## 3. The pipeline at a glance
 
 ```
-01 tiles -> 02 DEM -> 03 scenes -> [annotate in MaskForge] -> 04 training cache
+01 tiles -> 02 DEM -> 03 scenes -> [MaskForge session -> annotate in MaskForge] -> 04 training cache
    -> 05 train -> (05b pseudo-labels) -> (05c feature importance)
    -> 06 inference -> 07 monthly composites -> 08 mosaics
    -> 09 break detection -> 10 snow/ice/water -> 11 regrowth/severity
@@ -53,6 +59,7 @@ Run them in order: each step needs the real output of the previous one.
 python scripts/01_build_tiles.py
 python scripts/02_download_dem.py
 python scripts/03_download_scenes.py --split all --parallel
+python scripts/export_maskforge_palette.py     # MaskForge session + class palette; then annotate in MaskForge (section 8)
 python scripts/04_export_training_cache.py
 python scripts/05_train_model.py
 python scripts/05b_generate_pseudo_labels.py   # optional (training.pseudo_label.enabled)
@@ -172,6 +179,7 @@ A Streamlit GUI, the only place that pays the GeoTIFF cost. Point it at a folder
 
 ### Helpers
 - `export_georeferenced_cache.py`: training cache to GeoTIFF (see 04).
+- `export_maskforge_palette.py`: builds `configs/maskforge_session.json` (class palette from `classes.yaml` + source root) to open as the MaskForge session. See section 8.
 - `gen_synthetic_masks.py`: dev-only fake annotations to smoke-test 04 to 07 without a real MaskForge session.
 
 ---
@@ -222,7 +230,13 @@ A zarr store is a folder holding every scene of every sensor for one tile, so Ma
 
 **To start annotating:** give MaskForge the folder that contains the `.zarr` stores (`data/tiles/`) as its source root. It detects the stores automatically and lists every `(sensor, scene)` as its own entry, with the id `{tile_id}_{sensor}_{scene_id}`: that exact id is what script 04 parses back. Then:
 
-1. Load the class palette, generated from `classes.yaml` (`to_maskforge_palette()`), so both tools always share the same classes and colors.
+1. Generate the MaskForge session (class palette + source root, built from `classes.yaml`) so both tools always share the same classes and colors:
+
+   ```
+   python scripts/export_maskforge_palette.py
+   ```
+
+   This writes `configs/maskforge_session.json`; open it in MaskForge as the session. The file holds absolute local paths, so it is gitignored: regenerate it on each machine and after any change to `classes.yaml`.
 2. Paint the masks. Switch between the normal and the shadow-boosted RGB when working in dense forest or steep terrain.
 3. Save. The mask is written as an RGBA GeoTIFF to `<mask_root>/{tile_id}_{sensor}_{scene_id}/mask.tif`, the layout script 04 expects (`features.mask_root` must point at the same folder on both sides).
 
