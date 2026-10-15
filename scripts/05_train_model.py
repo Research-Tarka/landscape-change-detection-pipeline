@@ -449,6 +449,7 @@ def _compact_config(config) -> dict:
         "model": model,
         "features": {k: features[k] for k in (
             "feature_names", "index_names", "dem_layer_names", "include_doy_features", "include_latlon_features",
+            "include_illumination_features",
         )},
         "training": dump["training"],
         "split": {k: dump["split"][k] for k in ("ratios", "split_by", "split_seed")},

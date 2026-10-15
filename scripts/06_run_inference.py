@@ -128,6 +128,7 @@ def _build_feature_stack_for_scene(
     dem_layer_names: tuple[str, ...],
     include_doy_features: bool,
     include_latlon_features: bool,
+    include_illumination_features: bool = False,
 ):
     """Mirrors
     ``landscape_change_detection_pipeline.features.training_cache.build_feature_stack``
@@ -171,10 +172,12 @@ def _build_feature_stack_for_scene(
     dst_crs = attrs["crs_wkt"]
 
     dem_arrays = []
+    dem_layers = {}
     for name in dem_layer_names:
         arr, dem_transform, dem_crs = _cached_read_tile_dem(tile_dir, tile_id, name)
         if tuple(arr.shape) != tuple(dst_shape):
             arr = _resample_dem_to_sensor_grid(arr, dem_transform, dem_crs, dst_shape, dst_transform, dst_crs)
+        dem_layers[name] = arr
         dem_arrays.extend(dem_layer_to_channels(name, arr))
     dem_stack = np.stack(dem_arrays, axis=0).astype(np.float32) if dem_arrays else np.zeros(
         (0, *dst_shape), dtype=np.float32
@@ -191,6 +194,27 @@ def _build_feature_stack_for_scene(
     if include_latlon_features:
         stacks.append(latlon_stack(dst_transform, dst_crs, dst_shape))
         built_names.extend(LATLON_FEATURE_NAMES)
+
+    if include_illumination_features:
+        from landscape_change_detection_pipeline.features.illumination import (
+            ILLUMINATION_DEM_LAYERS,
+            ILLUMINATION_FEATURE_NAMES,
+            illumination_stack,
+        )
+
+        for name in ILLUMINATION_DEM_LAYERS:
+            if name not in dem_layers:
+                arr, dem_transform, dem_crs = _cached_read_tile_dem(tile_dir, tile_id, name)
+                if tuple(arr.shape) != tuple(dst_shape):
+                    arr = _resample_dem_to_sensor_grid(arr, dem_transform, dem_crs, dst_shape, dst_transform, dst_crs)
+                dem_layers[name] = arr
+        stacks.append(
+            illumination_stack(
+                sensor, scene_id, dst_transform, dst_crs,
+                dem_layers["elevation"], dem_layers["slope"], dem_layers["aspect"],
+            )
+        )
+        built_names.extend(ILLUMINATION_FEATURE_NAMES)
 
     stack = np.concatenate(stacks, axis=0).astype(np.float32)
     if tuple(built_names) != tuple(feature_names):
@@ -262,6 +286,7 @@ def _process_one_scene_impl(
             config.dem.tile_dir, tile_id, sensor, scene_id, loaded.feature_names,
             index_names, dem_layer_names,
             config.features.include_doy_features, config.features.include_latlon_features,
+            config.features.include_illumination_features,
         )
         if not scene_passes_precheck(features, inf_cfg.scene_precheck_min_valid_ratio):
             return tile_id, sensor, scene_id, "skip", "failed precheck"

@@ -349,6 +349,7 @@ training:
   deterministic: false                  # true pins cuDNN to deterministic algorithms (slower, exactly reproducible)
   amp: true                             # mixed precision (only takes effect on CUDA)
   grad_clip_norm: 1.0
+  ema_decay: 0.995                      # EMA of the weights (0 = off): the smoothed copy is validated and saved
   main_iou_metric: miou_macro           # miou_macro | miou_weighted | miou_inv_freq -- drives early stopping
   augment_flips: true
   augment_rotate90: true

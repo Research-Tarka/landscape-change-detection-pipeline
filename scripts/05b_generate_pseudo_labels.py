@@ -123,6 +123,7 @@ def main(argv: list[str] | None = None) -> int:
         dem_layer_names=tuple(dem_layer_names),
         include_doy_features=config.features.include_doy_features,
         include_latlon_features=config.features.include_latlon_features,
+        include_illumination_features=config.features.include_illumination_features,
         confidence_threshold=pseudo_cfg.confidence_threshold,
         max_scenes=pseudo_cfg.max_scenes,
         sensors=pseudo_cfg.sensors,

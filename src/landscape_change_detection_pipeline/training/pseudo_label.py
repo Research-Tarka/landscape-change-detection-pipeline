@@ -151,6 +151,7 @@ def generate_pseudo_labels(
     min_rare_pixels: int = 500,
     prefetch_workers: int = 3,
     label_remap: Optional[Sequence[int]] = None,
+    include_illumination_features: bool = False,
 ) -> list[Path]:
     """Score every unlabeled scene, threshold by confidence, and write the
     kept pixels to ``pseudo_label_root`` in the same per-scene ``.npz``
@@ -195,6 +196,7 @@ def generate_pseudo_labels(
         *expand_dem_feature_names(dem_layer_names),
         *(("doy_sin", "doy_cos") if include_doy_features else ()),
         *(("lat_norm", "lon_norm") if include_latlon_features else ()),
+        *(("illum_cos", "terrain_shadow") if include_illumination_features else ()),
     ]
 
     written: list[Path] = []
@@ -220,6 +222,7 @@ def generate_pseudo_labels(
             built = build_feature_stack(
                 tile_dir, scene.tile_id, scene.sensor, scene.scene_id,
                 index_names, dem_layer_names, include_doy_features, include_latlon_features,
+                include_illumination_features,
             )
         except Exception:  # noqa: BLE001 -- one bad scene must not abort the whole streaming run
             logger.warning("[pseudo-label] skipping %s: feature-stack build failed", scene.scene_key, exc_info=True)

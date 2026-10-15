@@ -362,6 +362,10 @@ class FeaturesConfig(BaseModel):
     dem_layer_names: Optional[list[str]] = None
     include_doy_features: bool = True
     include_latlon_features: bool = True
+    #: adds ``illum_cos``/``terrain_shadow`` (sun incidence on the slope + terrain
+    #: shadow, see ``features/illumination.py``). Off by default: turning it on
+    #: changes the model's input channel count (re-export the cache and retrain).
+    include_illumination_features: bool = False
 
     @field_validator("index_names")
     @classmethod
@@ -428,6 +432,10 @@ def resolved_extra_feature_names(features: FeaturesConfig) -> tuple[str, ...]:
         names += DOY_FEATURE_NAMES
     if features.include_latlon_features:
         names += LATLON_FEATURE_NAMES
+    if features.include_illumination_features:
+        from landscape_change_detection_pipeline.features.illumination import ILLUMINATION_FEATURE_NAMES
+
+        names += ILLUMINATION_FEATURE_NAMES
     return names
 
 
@@ -947,6 +955,11 @@ class TrainingConfig(BaseModel):
     deterministic: bool = False
     amp: bool = True
     grad_clip_norm: float = 1.0
+    #: Exponential moving average of the weights (0 = off). A smoothed copy of the model is
+    #: updated after every optimiser step (``w_ema = d * w_ema + (1 - d) * w``); it is the copy
+    #: that is validated, early-stopped on and saved, so the checkpoint (and inference) use the
+    #: smoothed weights. 0.99-0.999: the averaging horizon is ~1 / (1 - d) steps.
+    ema_decay: float = 0.0
     main_iou_metric: str = "miou_macro"
     augment_flips: bool = True
     augment_rotate90: bool = True

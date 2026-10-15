@@ -88,6 +88,12 @@ _LANDSAT_DATE_RE = re.compile(r"_(\d{4})(\d{2})(\d{2})$")
 _S2_DATE_RE = re.compile(r"^(\d{4})(\d{2})(\d{2})T\d{6}")
 
 
+def _illumination_names() -> tuple[str, ...]:
+    from landscape_change_detection_pipeline.features.illumination import ILLUMINATION_FEATURE_NAMES
+
+    return ILLUMINATION_FEATURE_NAMES
+
+
 class MaskDiscoveryError(Exception):
     """Raised when a mask file cannot be located or parsed for a given scene key."""
 
@@ -378,6 +384,7 @@ def build_feature_stack(
     dem_layer_names: tuple[str, ...] = DEM_LAYER_NAMES,
     include_doy_features: bool = True,
     include_latlon_features: bool = True,
+    include_illumination_features: bool = False,
 ) -> tuple[np.ndarray, list[str], list[str], list[float], str]:
     """Assemble the ``(C, H, W)`` feature stack for one scene: spectral
     indices, then DEM layers, then (if enabled) acquisition-date and
@@ -412,6 +419,7 @@ def build_feature_stack(
 
     dem_arrays = []
     dem_provenance = []
+    dem_layers: dict[str, np.ndarray] = {}
     for name in dem_layer_names:
         arr, dem_transform, dem_crs = read_tile_dem(tile_dir, tile_id, name)
         if tuple(arr.shape) != tuple(dst_shape):
@@ -419,6 +427,7 @@ def build_feature_stack(
             dem_provenance.append("resampled_for_alignment")
         else:
             dem_provenance.append("native")
+        dem_layers[name] = arr
         dem_arrays.extend(dem_layer_to_channels(name, arr))
         dem_provenance.extend([dem_provenance.pop()] * len(DEM_LAYER_CHANNELS.get(name, (name,))))
     dem_stack = np.stack(dem_arrays, axis=0).astype(np.float32) if dem_arrays else np.zeros(
@@ -439,6 +448,28 @@ def build_feature_stack(
         stacks.append(latlon_stack(dst_transform, dst_crs, dst_shape))
         feature_names.extend(LATLON_FEATURE_NAMES)
         feature_provenance.extend(["native"] * len(LATLON_FEATURE_NAMES))
+
+    if include_illumination_features:
+        from landscape_change_detection_pipeline.features.illumination import (
+            ILLUMINATION_DEM_LAYERS,
+            ILLUMINATION_FEATURE_NAMES,
+            illumination_stack,
+        )
+
+        for name in ILLUMINATION_DEM_LAYERS:  # layers the config did not list are read here
+            if name not in dem_layers:
+                arr, dem_transform, dem_crs = read_tile_dem(tile_dir, tile_id, name)
+                if tuple(arr.shape) != tuple(dst_shape):
+                    arr = _resample_dem_to_sensor_grid(arr, dem_transform, dem_crs, dst_shape, dst_transform, dst_crs)
+                dem_layers[name] = arr
+        stacks.append(
+            illumination_stack(
+                sensor, scene_id, dst_transform, dst_crs,
+                dem_layers["elevation"], dem_layers["slope"], dem_layers["aspect"],
+            )
+        )
+        feature_names.extend(ILLUMINATION_FEATURE_NAMES)
+        feature_provenance.extend(["native"] * len(ILLUMINATION_FEATURE_NAMES))
 
     stack = np.concatenate(stacks, axis=0).astype(np.float32)
     transform_list = dst_transform if isinstance(dst_transform, list) else transform_to_list(dst_transform)
@@ -494,6 +525,26 @@ def cache_is_current(cache_dir: Path, expected_signature: str) -> bool:
     except (OSError, json.JSONDecodeError):
         return False
     return meta.get("signature") == expected_signature
+
+
+def cache_is_reusable_without_source(cache_dir: Path, expected_feature_names: Sequence[str]) -> bool:
+    """True when a finished cache exists with the current schema version and
+    exactly the expected feature list, regardless of source mtimes/paths.
+    Used when the tile's zarr store is absent (e.g. a cache shared between
+    machines/projects): the cache is trusted as-is instead of being rebuilt."""
+    npz_path = cache_dir / CACHE_FILENAME
+    meta_path = cache_dir / META_FILENAME
+    if not npz_path.exists() or not meta_path.exists():
+        return False
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        if meta.get("schema_version") != SCHEMA_VERSION:
+            return False
+        with np.load(npz_path, allow_pickle=False) as data:
+            names = [str(n) for n in data["feature_names"]]
+    except (OSError, ValueError, KeyError, json.JSONDecodeError):
+        return False
+    return names == list(expected_feature_names)
 
 
 def upgrade_to_memmap(cache_dir: Path) -> bool:
@@ -635,6 +686,7 @@ def export_annotated_scene(
     dem_layer_names: tuple[str, ...] = DEM_LAYER_NAMES,
     include_doy_features: bool = True,
     include_latlon_features: bool = True,
+    include_illumination_features: bool = False,
 ) -> Optional[Path]:
     """Export one annotated scene into its training-cache ``.npz``, skipping
     the rebuild if an up-to-date cache already exists. Returns the ``.npz``
@@ -645,7 +697,20 @@ def export_annotated_scene(
         *expand_dem_feature_names(dem_layer_names),
         *(DOY_FEATURE_NAMES if include_doy_features else ()),
         *(LATLON_FEATURE_NAMES if include_latlon_features else ()),
+        *(_illumination_names() if include_illumination_features else ()),
     ]
+    # Source zarr absent but a compatible cache exists (shared between
+    # projects/machines): trust it rather than failing or rebuilding.
+    if not zarr_path_for_tile(tile_dir, scene.tile_id).exists() and cache_is_reusable_without_source(
+        cache_dir, feature_names
+    ):
+        upgrade_to_memmap(cache_dir)
+        return None
+
+    zarr_path = zarr_path_for_tile(tile_dir, scene.tile_id)
+    if not zarr_path.exists():
+        raise FileNotFoundError(f"zarr store missing for {scene.scene_key}: {zarr_path} (and no reusable cache)")
+
     source_paths = scene_source_paths(tile_dir, scene.tile_id, scene.mask_path)
     signature = scene_cache_signature(scene.scene_key, source_paths, feature_names)
 
@@ -662,6 +727,7 @@ def export_annotated_scene(
         dem_layer_names,
         include_doy_features,
         include_latlon_features,
+        include_illumination_features,
     )
     labels = read_mask_labels(
         scene.mask_path,
@@ -696,6 +762,7 @@ def export_all_annotated_scenes(
     dem_layer_names: tuple[str, ...] = DEM_LAYER_NAMES,
     include_doy_features: bool = True,
     include_latlon_features: bool = True,
+    include_illumination_features: bool = False,
 ) -> list[Path]:
     """Export every MaskForge-annotated scene under ``mask_root`` into
     ``train_root``, in sorted ``(tile_id, sensor, scene_id)`` order. Returns
@@ -703,16 +770,21 @@ def export_all_annotated_scenes(
     skipped and not included."""
     written: list[Path] = []
     for scene in discover_annotated_scenes(mask_root):
-        result = export_annotated_scene(
-            tile_dir,
-            train_root,
-            scene,
-            class_config,
-            index_names,
-            dem_layer_names,
-            include_doy_features,
-            include_latlon_features,
-        )
+        try:
+            result = export_annotated_scene(
+                tile_dir,
+                train_root,
+                scene,
+                class_config,
+                index_names,
+                dem_layer_names,
+                include_doy_features,
+                include_latlon_features,
+                include_illumination_features,
+            )
+        except FileNotFoundError as exc:
+            print(f"[training-cache] SKIP {exc}")
+            continue
         if result is not None:
             written.append(result)
     return written

@@ -51,7 +51,9 @@ def build_pruner(name: str, max_resource: Optional[int] = None) -> Any:
 
     key = str(name or "none").strip().lower()
     if key == "median":
-        return optuna.pruners.MedianPruner()
+        # Warm-up: the torch val mIoU swings by ~0.05 between epochs, so early
+        # comparisons would prune good trials on a bad epoch.
+        return optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=8)
     if key == "hyperband":
         return optuna.pruners.HyperbandPruner(
             min_resource=1, max_resource=max(1, int(max_resource)) if max_resource else "auto"

@@ -140,6 +140,18 @@ def _snapshot(model: nn.Module) -> dict[str, torch.Tensor]:
     return {key: value.detach().to("cpu", copy=True) for key, value in model.state_dict().items()}
 
 
+@torch.no_grad()
+def _ema_update(ema_model: nn.Module, model: nn.Module, decay: float) -> None:
+    """``ema = decay * ema + (1 - decay) * live`` for every floating-point entry of the
+    state dict (weights and BatchNorm running stats); integer buffers are copied."""
+    live = model.state_dict()
+    for key, ema_value in ema_model.state_dict().items():
+        if ema_value.dtype.is_floating_point:
+            ema_value.mul_(decay).add_(live[key].detach(), alpha=1.0 - decay)
+        else:
+            ema_value.copy_(live[key])
+
+
 def _unwrap(model: nn.Module) -> nn.Module:
     """Return the original module behind a ``torch.compile`` wrapper.
 
@@ -802,7 +814,10 @@ def _build_loaders(
     val_workers = config.num_workers if config.val_num_workers is None else config.val_num_workers
     train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True,
                               **loader_kwargs(config.num_workers))
-    val_loader = DataLoader(val_dataset, batch_size=config.batch_size, shuffle=False,
+    # Training accumulates over micro-batches; validation must not forward the full batch_size
+    # at once (4x the activation memory -> VRAM overflow on 8 GB cards).
+    val_batch = config.micro_batch_size or config.batch_size
+    val_loader = DataLoader(val_dataset, batch_size=val_batch, shuffle=False,
                             **loader_kwargs(val_workers))
     return train_loader, val_loader
 
@@ -1001,6 +1016,10 @@ def _train_model(
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, config.epochs))
     use_amp = config.amp and resolved_device.type == "cuda"
+    # Smoothed copy of the weights: validated, early-stopped on and saved in place of the live
+    # model (config.ema_decay, 0 = off).
+    ema_model = copy.deepcopy(_unwrap(model)).eval() if config.ema_decay > 0.0 else None
+    ema_steps = 0
     scaler = GradScaler(resolved_device.type, enabled=use_amp)
 
     supports_deep_supervision = model_cfg.type == "unet" and model_cfg.unet.deep_supervision
@@ -1078,6 +1097,10 @@ def _train_model(
                 continue
             scaler.step(optimizer)
             scaler.update()
+            if ema_model is not None:
+                ema_steps += 1
+                # Warm-up: a plain decay would keep the random init weights for the first steps.
+                _ema_update(ema_model, _unwrap(model), min(config.ema_decay, (1 + ema_steps) / (10 + ema_steps)))
 
             running_loss += float(loss.item()) * x.size(0)
             seen += x.size(0)
@@ -1086,7 +1109,8 @@ def _train_model(
             print(f"[epoch {epoch}] skipped {skipped_batches} batch(es) with non-finite loss/gradient")
         train_loss = running_loss / max(seen, 1)
         val_loss, confusion = evaluate(
-            model, val_loader, resolved_device, class_weights, use_amp, num_classes, pred_remap=pred_remap,
+            ema_model if ema_model is not None else model,
+            val_loader, resolved_device, class_weights, use_amp, num_classes, pred_remap=pred_remap,
         )
         val_metrics = compute_confusion_metrics(confusion, num_classes, class_names=list(class_names))["macro"]
 
@@ -1126,7 +1150,7 @@ def _train_model(
             best_score = score
             best_epoch = epoch
             best_state = {
-                "model": _snapshot(_unwrap(model)),
+                "model": _snapshot(ema_model if ema_model is not None else _unwrap(model)),
                 "epoch": epoch,
                 "metric_name": metric_name,
                 "val_metric": score,
@@ -1145,7 +1169,7 @@ def _train_model(
 
     if not best_state:
         best_state = {
-            "model": _snapshot(_unwrap(model)),
+            "model": _snapshot(ema_model if ema_model is not None else _unwrap(model)),
             "epoch": last_epoch,
             "metric_name": config.main_iou_metric,
             "val_metric": history["val_miou"][-1] if history["val_miou"] else float("nan"),
