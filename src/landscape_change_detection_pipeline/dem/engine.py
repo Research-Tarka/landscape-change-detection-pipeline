@@ -4,7 +4,8 @@ Purpose
 -------
 For each tile in the registry (:mod:`landscape_change_detection_pipeline.tiles.registry`):
 fetch the best available source DEM over the tile's buffered analysis window
-(MRDEM-30 DTM, else Copernicus GLO-30 -- :mod:`.sources`), orient/mask/derive
+(the first usable source of the priority list -- MRDEM-30 DTM,
+ArcticDEM, Copernicus GLO-30 -- gaps filled from the next one, :mod:`.sources`), orient/mask/derive
 slope and aspect (:mod:`.processing`), and write everything into the tile's
 zarr store (:mod:`.zarr_store`).
 
@@ -15,7 +16,7 @@ Inputs
 Outputs
 -------
 - ``<data_root>/tiles/<tile_id>.zarr`` -- ``dem`` group holding ``elevation``,
-  ``slope``, ``aspect`` (float32, EPSG:26910, NaN nodata) plus provenance
+  ``slope``, ``aspect`` (float32, the tile's CRS, NaN nodata) plus provenance
   attrs.
 - ``<data_root>/tiles/<tile_id>.dem.done`` -- completion flag (enables resume).
 """
@@ -37,6 +38,16 @@ from .zarr_store import write_tile_dem
 DONE_SUFFIX = ".dem.done"
 
 
+def epsg_from_crs(crs) -> int:
+    """EPSG integer of a registry ``crs`` value (``"EPSG:26909"``, ``26909``, WKT...)."""
+    from pyproj import CRS
+
+    epsg = CRS.from_user_input(crs).to_epsg()
+    if epsg is None:
+        raise ValueError(f"CRS {crs!r} has no EPSG code")
+    return int(epsg)
+
+
 def process_one_tile(
     tile_dir: Path,
     tile_id: str,
@@ -45,6 +56,9 @@ def process_one_tile(
     copernicus_fallback: bool = True,
     force_copernicus: bool = False,
     target_resolution_m: float = 10.0,
+    crs=TARGET_EPSG,
+    source_priority=None,
+    min_valid_pct: float = 90.0,
 ) -> tuple[str, str]:
     """Extract and write the DEM products for one tile.
 
@@ -54,7 +68,9 @@ def process_one_tile(
 
     ``target_resolution_m`` (normally ``DemConfig.target_resolution_m``) is
     the pipeline's reference-grid resolution -- every later sensor scene must
-    land on this exact grid (see ``dem/grid_check.py``).
+    land on this exact grid (see ``dem/grid_check.py``). ``crs`` is the tile's
+    own CRS (registry ``crs`` column); ``window_bounds`` are in it.
+    ``source_priority`` / ``min_valid_pct``: see :func:`.sources.load_best_dem`.
     """
     tile_dir = Path(tile_dir)
     done_flag = tile_dir / f"{tile_id}{DONE_SUFFIX}"
@@ -62,15 +78,18 @@ def process_one_tile(
         if not overwrite and done_flag.exists():
             return tile_id, "skip (already done)"
 
+        epsg = epsg_from_crs(crs)
         dem, source_label, base_res, valid_pct = load_best_dem(
             window_bounds,
-            src_crs=TARGET_EPSG,
+            src_crs=epsg,
             use_copernicus_fallback=copernicus_fallback,
             force_copernicus=force_copernicus,
             target_resolution_m=target_resolution_m,
+            source_priority=source_priority,
+            min_valid_pct=min_valid_pct,
         )
         if dem is None:
-            return tile_id, "skip (no DEM coverage from MRDEM-30 or Copernicus GLO-30)"
+            return tile_id, "skip (no DEM coverage from any source in the priority list)"
 
         products = build_tile_dem_products(dem, window_bounds)
         elev_valid_pct = valid_fraction_pct(products["elevation"])
@@ -86,7 +105,7 @@ def process_one_tile(
             "tile_id": tile_id,
             "source_dem": source_label,
             "source_base_resolution_m": base_res,
-            "crs": f"EPSG:{TARGET_EPSG}",
+            "crs": f"EPSG:{epsg}",
             "window_bounds": list(window_bounds),
             "source_window_valid_pct": round(valid_pct, 2),
             "elevation_valid_pct": round(elev_valid_pct, 2),
@@ -114,6 +133,8 @@ def run_dem_extraction(
     copernicus_fallback: bool = True,
     force_copernicus: bool = False,
     target_resolution_m: float = 10.0,
+    source_priority=None,
+    min_valid_pct: float = 90.0,
 ) -> list[tuple[str, str]]:
     """Run DEM extraction over every tile in ``registry`` (a tile_registry DataFrame).
 
@@ -130,6 +151,8 @@ def run_dem_extraction(
     rows = registry if tile_ids is None else registry[registry["tile_id"].isin(tile_ids)]
     results = []
     for _, row in tqdm(rows.iterrows(), total=len(rows), desc="DEM extraction"):
+        # Per-AOI priority (registry column) wins over the global list.
+        row_priority = str(row["dem_source_priority"]).split(",") if "dem_source_priority" in row and row["dem_source_priority"] else None
         bounds = (
             float(row["window_minx"]),
             float(row["window_miny"]),
@@ -145,6 +168,9 @@ def run_dem_extraction(
                 copernicus_fallback=copernicus_fallback,
                 force_copernicus=force_copernicus,
                 target_resolution_m=target_resolution_m,
+                crs=row["crs"] if "crs" in row else TARGET_EPSG,
+                source_priority=row_priority or source_priority,
+                min_valid_pct=min_valid_pct,
             )
         )
     return results

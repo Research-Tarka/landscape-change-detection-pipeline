@@ -291,9 +291,31 @@ def build_period_mosaic(
     }
 
 
-def mosaic_output_path(output_root: str | Path, period: str) -> Path:
-    """``<output_root>/<period>/mosaic.npz``."""
-    return Path(output_root) / period / "mosaic.npz"
+def mosaic_output_path(output_root: str | Path, period: str, aoi_id: str | None = None) -> Path:
+    """``<output_root>/<period>/mosaic.npz``, or ``.../<period>/<aoi_id>/mosaic.npz``
+    when the registry holds several AOIs (see :func:`mosaic_groups`)."""
+    base = Path(output_root) / period
+    return (base / aoi_id if aoi_id else base) / "mosaic.npz"
+
+
+def mosaic_groups(registry: pd.DataFrame) -> list[tuple[str | None, pd.DataFrame]]:
+    """Split the registry into the groups that each get their own mosaic.
+
+    One mosaic is one grid in one CRS, so tiles of different ``aoi_id`` (a UTM
+    zone of a source, or another source) can never share one. A registry with a
+    single ``aoi_id`` (or an old one without the column) stays one group keyed
+    ``None``, which keeps the original ``<period>/mosaic.npz`` path. With several
+    AOIs, those made of a single tile are skipped.
+    """
+    if "aoi_id" not in registry.columns or registry["aoi_id"].nunique() <= 1:
+        return [(None, registry)]
+    # An AOI of a single tile (e.g. one small glacier among thousands) has nothing to
+    # stitch: its tile composite is already its product, so no mosaic is written.
+    return [
+        (str(aoi_id), group)
+        for aoi_id, group in registry.groupby("aoi_id", sort=True)
+        if len(group) > 1
+    ]
 
 
 def write_mosaic(path: str | Path, result: dict) -> Path:
@@ -345,13 +367,14 @@ def build_all_period_mosaics(
 
     written: list[Path] = []
     for period in periods:
-        out_path = mosaic_output_path(output_root, period)
-        if out_path.is_file() and not overwrite:
-            continue
-        tiles = load_period_tile_composites(composites_root, registry, period)
-        if not tiles:
-            continue
-        result = build_period_mosaic(tiles, registry, nodata=nodata)
-        write_mosaic(out_path, result)
-        written.append(out_path)
+        for aoi_id, group in mosaic_groups(registry):
+            out_path = mosaic_output_path(output_root, period, aoi_id)
+            if out_path.is_file() and not overwrite:
+                continue
+            tiles = load_period_tile_composites(composites_root, group, period)
+            if not tiles:
+                continue
+            result = build_period_mosaic(tiles, group, nodata=nodata)
+            write_mosaic(out_path, result)
+            written.append(out_path)
     return written

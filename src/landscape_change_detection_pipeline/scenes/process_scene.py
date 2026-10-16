@@ -329,6 +329,7 @@ def process_and_store_scene(
             tile_id,
             tile_dir,
             other_arrays={f"{sensor_key}/{scene_id}": (toa.shape[-2:], transform, crs)},
+            expected_crs=crs,
         )
         if not grid_result.ok:
             return f"error (grid mismatch against DEM: {grid_result.report()})"

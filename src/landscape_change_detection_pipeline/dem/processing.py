@@ -9,8 +9,8 @@ and aspect derived from it.
 
 Inputs
 ------
-- A source DEM ``xarray.DataArray`` in the working CRS (EPSG:26910).
-- The tile's buffered analysis-window bounds (also EPSG:26910).
+- A source DEM ``xarray.DataArray`` in the tile's CRS (a UTM zone; EPSG:26910 for the original AOI).
+- The tile's buffered analysis-window bounds (same CRS).
 
 Outputs
 -------
@@ -34,6 +34,12 @@ import rioxarray  # noqa: F401  -- registers the .rio accessor
 import xarray as xr
 
 from .sources import TARGET_EPSG, _wrap_array
+
+
+def _epsg_of(da: xr.DataArray) -> int:
+    """EPSG of ``da``'s CRS (the tile's own CRS), ``TARGET_EPSG`` if it has none."""
+    crs = da.rio.crs
+    return (crs.to_epsg() if crs is not None else None) or TARGET_EPSG
 
 
 def orient_north_up(dem: xr.DataArray) -> xr.DataArray:
@@ -64,7 +70,7 @@ def clip_to_bounds(
 
     values = np.asarray(dem.values, dtype=np.float32)
     out = np.where(inside, values, np.nan).astype(np.float32)
-    return _wrap_array(out, dem.rio.transform(recalc=False), TARGET_EPSG)
+    return _wrap_array(out, dem.rio.transform(recalc=False), _epsg_of(dem))
 
 
 def compute_slope_aspect(dem: xr.DataArray) -> tuple[xr.DataArray, xr.DataArray]:
@@ -104,8 +110,9 @@ def compute_slope_aspect(dem: xr.DataArray) -> tuple[xr.DataArray, xr.DataArray]
     slope = np.where(invalid, np.nan, slope).astype(np.float32)
     aspect = np.where(invalid, np.nan, aspect).astype(np.float32)
 
-    slope_da = _wrap_array(slope, transform, TARGET_EPSG)
-    aspect_da = _wrap_array(aspect, transform, TARGET_EPSG)
+    epsg = _epsg_of(dem)
+    slope_da = _wrap_array(slope, transform, epsg)
+    aspect_da = _wrap_array(aspect, transform, epsg)
     return slope_da, aspect_da
 
 

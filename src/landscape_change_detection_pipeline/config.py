@@ -66,6 +66,37 @@ class GeeConfig(BaseModel):
     projects: list[str] = Field(default_factory=list)
 
 
+class AoiSourceConfig(BaseModel):
+    """One AOI input of ``tiles.aoi_sources`` (file, or folder of vector files).
+
+    ``mode``: ``grid`` = regular grid over the dissolved source; ``single`` =
+    one tile per feature, sized to the feature; ``auto`` = ``single`` for
+    features that fit under ``max_tile_size_m``, ``grid`` for the others.
+    Fields left ``None`` fall back to the matching ``tiles`` value.
+    ``dem_source_priority`` overrides ``dem.source_priority`` for this source.
+    """
+
+    path: str
+    layer: Optional[str] = None
+    name: Optional[str] = None
+    mode: str = "grid"
+    crs: str = "auto"
+    tile_size_m: Optional[float] = None
+    max_tile_size_m: Optional[float] = None
+    min_tile_size_m: Optional[float] = None
+    min_aoi_cover_pct: Optional[float] = None
+    tile_id_prefix: Optional[str] = None
+    name_field: Optional[str] = None
+    dem_source_priority: Optional[list[str]] = None
+
+    @field_validator("mode")
+    @classmethod
+    def _check_mode(cls, v: str) -> str:
+        if v not in ("grid", "single", "auto"):
+            raise ValueError(f"mode must be grid | single | auto, got {v!r}")
+        return v
+
+
 class TilesConfig(BaseModel):
     """AOI tiling parameters (see :mod:`landscape_change_detection_pipeline.tiles.registry`).
 
@@ -90,11 +121,32 @@ class TilesConfig(BaseModel):
     """
 
     aoi_path: str = "CHANGE_ME.gpkg"
-    aoi_layer: str = "output"
-    aoi_crs: str = "EPSG:26910"
+    aoi_layer: Optional[str] = "output"
+    # "auto" = UTM zone(s) chosen from the AOI's longitude; the AOI is cut at
+    # zone boundaries and each piece is tiled in its own zone. An explicit
+    # "EPSG:xxxx" keeps a single CRS for the whole source.
+    aoi_crs: str = "auto"
+    # Multi-source input. When non-empty it replaces aoi_path/aoi_layer/aoi_crs/
+    # tile_id_prefix (those legacy fields describe one implicit source).
+    aoi_sources: list["AoiSourceConfig"] = Field(default_factory=list)
     tile_size_m: float = 8000.0
+    # Largest tile side (before buffer). Also the GEE-request safety cap: a
+    # "single"/"auto" object bigger than this is cut into a grid of tiles.
+    max_tile_size_m: float = 8000.0
+    # Smallest tile side (null = off): a smaller object keeps a tile of this size,
+    # centred on it. Nothing in the pipeline requires one (training and inference
+    # reflect-pad any scene smaller than a patch); 500 m = 50 px keeps a usable
+    # window once the buffer is added (100 px, ~33 Landsat px).
+    min_tile_size_m: Optional[float] = 500.0
+    # global = tile edges at multiples of tile_size_m in the CRS (stable ids,
+    # pixel-aligned); aoi_bbox = legacy, grid origin at the AOI bbox min corner.
+    grid_anchor: str = "global"
+    # 0 = keep every cell that overlaps the AOI (the tiles then cover all of it).
+    min_aoi_cover_pct: float = 0.0
     buffer_m: float = 250.0
     pilot_bbox: Optional[list[float]] = None
+    # CRS of pilot_bbox. null = the source CRS (needs an explicit crs, not "auto").
+    pilot_bbox_crs: Optional[str] = None
     # If False, a pilot_bbox outside the AOI polygon is tiled as-is instead
     # of raising -- for pilot zones deliberately outside the tracked AOI.
     pilot_bbox_requires_aoi_overlap: bool = True
@@ -124,6 +176,12 @@ class DemConfig(BaseModel):
     use_copernicus_fallback: bool = True
     force_copernicus: bool = False
     target_resolution_m: float = 10.0
+    # Sources tried in order (mrdem | arcticdem | copernicus). Overridable per
+    # AOI source via tiles.aoi_sources[].dem_source_priority.
+    source_priority: list[str] = Field(default_factory=lambda: ["arcticdem", "mrdem", "copernicus"])
+    # A source below this valid-pixel share is completed pixel by pixel from the
+    # next source(s) in the priority list.
+    min_valid_pct: float = 90.0
 
 
 class SceneDownloadConfig(BaseModel):

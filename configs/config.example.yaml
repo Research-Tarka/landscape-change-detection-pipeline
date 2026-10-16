@@ -40,6 +40,34 @@ tiles:
   aoi_path: CHANGE_ME                  # path to your AOI GeoPackage
   aoi_layer: output
   aoi_crs: EPSG:26910
+  # --- Several AOIs / modes (replaces aoi_path/aoi_layer/aoi_crs/tile_id_prefix above when non-empty) ---
+  # Each source is a vector file (gpkg/shp/geojson) or a folder of them, with its own mode:
+  #   grid   = regular grid over the dissolved source (every cell overlapping it is kept)
+  #   single = one tile per feature, sized to the feature (square, centred, 10 m aligned)
+  #   auto   = single for features that fit under max_tile_size_m, grid for the others
+  # crs "auto" = UTM zone(s) from the longitude: the source is CUT at zone boundaries (6 deg,
+  # ~330 km at 60N) and each piece tiled in its own zone (aoi_id "<name>_utm06N"); an explicit
+  # "EPSG:xxxx" keeps one CRS for the source. A mosaic is built per aoi_id.
+  # aoi_sources:
+  #   - path: D:/data/RGI/RGI2000-v7.0-G-01_alaska          # folder or file
+  #     name: alaska                                         # default: file name; id of the AOI (and tile_id prefix) when no name_field
+  #     name_field: glims_id                                 # column holding one id per feature: each feature (glacier) becomes its own
+  #                                                          # AOI, aoi_id/tile_id = '<value>_tile_0000_0000', >= 1 tile each
+  #     mode: grid
+  #     crs: auto
+  #     dem_source_priority: [arcticdem, copernicus]         # optional per-source override of dem.source_priority
+  #   - path: D:/data/sites/my_sites.gpkg
+  #     layer: sites
+  #     mode: auto
+  #     name_field: site_name                                # one AOI per site: tile_id = <site_name>_tile_0000_0000
+  #     tile_size_m: 6000.0                                  # overrides tiles.tile_size_m for this source
+  max_tile_size_m: 8000.0    # largest tile side (before buffer) = GEE request safety cap; bigger objects are gridded
+  min_tile_size_m: 500.0     # smallest tile side (a smaller object keeps this size, centred); null = off. Nothing requires one: training/inference reflect-pad small scenes. 500 m = 50 px (100 px with the buffer)
+  # global = tile edges at multiples of tile_size_m (stable ids, 10 m aligned, sources line up);
+  # aoi_bbox = legacy origin at the AOI bbox corner. Keep aoi_bbox for a registry whose scenes are already downloaded.
+  grid_anchor: global
+  min_aoi_cover_pct: 0.0     # 0 = keep every cell overlapping the AOI (tiles cover all of it); >0 drops thin slivers
+  pilot_bbox_crs: null       # CRS of pilot_bbox; null = the source CRS (needed when crs is "auto", e.g. EPSG:4326)
   tile_size_m: 8000.0        # square tile side, before buffering (metres)
   buffer_m: 250.0            # edge buffer added to each tile's analysis window (metres)
   pilot_bbox: null           # optional [minx, miny, maxx, maxy] in aoi_crs, to restrict to a pilot sub-area
@@ -68,6 +96,14 @@ dem:
   use_copernicus_fallback: true        # fall back to Copernicus GLO-30 if MRDEM-30 has no coverage
   force_copernicus: false              # debug/test switch: skip MRDEM entirely
   target_resolution_m: 10.0            # reference grid resolution every array is reprojected onto
+  # Sources tried in order (mrdem | arcticdem | copernicus); a source below min_valid_pct valid
+  # pixels is completed pixel by pixel from the next one (shifted by the median offset on their
+  # common pixels: vertical datums differ). Override per AOI via tiles.aoi_sources[].dem_source_priority.
+  # ArcticDEM is a 2 m DSM (canopy / ice surface included), north of ~50N, with an ellipsoidal vertical
+  # datum (several to ~20 m above GLO-30 in Alaska). MRDEM-30 is a DTM (canopy removed), Canada
+  # (and a little beyond the border). For forest AOIs put mrdem first, per source if needed.
+  source_priority: [arcticdem, mrdem, copernicus]
+  min_valid_pct: 90.0
 
 # ----------------------------------------------------------------------
 # GEE scene search/download

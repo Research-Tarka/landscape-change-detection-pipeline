@@ -1,23 +1,33 @@
-"""DEM sources: MRDEM-30 DTM (primary) with a Copernicus GLO-30 fallback.
+"""DEM sources: MRDEM-30 DTM, ArcticDEM and Copernicus GLO-30, in a priority order.
 
 Purpose
 -------
 Fetch an elevation model covering a tile's buffered analysis window, in the
-pipeline's working CRS (``EPSG:26910``),
-from one of two sources:
+tile's own CRS (the registry's ``crs`` column; ``TARGET_EPSG`` is only the
+default), on the pipeline's 10 m reference grid, from the first usable source of
+a configurable priority list (``dem.source_priority``, default
+``arcticdem, mrdem, copernicus``). A source below ``min_valid_pct`` valid pixels
+is completed pixel by pixel from the next ones:
 
 1. **MRDEM-30 DTM** (NRCan CanElevation Series), read as a windowed COG read
    against its single nationwide mosaic COG on the public AWS bucket. This is
    a genuine bare-earth digital *terrain* model (lidar where NRCan has it,
    Copernicus GLO-30 terrain-corrected elsewhere), so it is not biased by
    forest canopy the way a raw InSAR DSM is.
-2. **Copernicus GLO-30** (``COPERNICUS/DEM/GLO30_2024_1`` in Earth Engine),
-   used only if MRDEM has no usable coverage for the window.
+2. **ArcticDEM** (PGC, 2 m DSM mosaic ``UMN/PGC/ArcticDEM/V4/2m_mosaic`` in
+   Earth Engine, polar stereographic), averaged down to the 10 m grid by Earth
+   Engine's pyramid. North of ~50 degN, with voids (cloud / featureless snow)
+   that the next source fills.
+3. **Copernicus GLO-30** (``COPERNICUS/DEM/GLO30_2024_1`` in Earth Engine,
+   EGM2008 heights), global.
+
+Vertical datums differ between sources (MRDEM CGVD2013, GLO-30 EGM2008,
+ArcticDEM probably the WGS84 ellipsoid): when a source fills another, it is
+shifted by the median difference over their common pixels so no step appears.
 
 Inputs
 ------
-- A bounding box in the pipeline's working CRS (the tile's buffered analysis
-  window).
+- A bounding box in the tile's CRS (the tile's buffered analysis window).
 
 Outputs
 -------
@@ -28,7 +38,7 @@ Outputs
 from __future__ import annotations
 
 import os
-from typing import Optional
+from typing import Optional, Sequence
 
 import numpy as np
 import rasterio
@@ -59,6 +69,21 @@ MRDEM_DSM_URL = f"{MRDEM_BASE_URL}/mrdem-30-dsm.tif"
 #: ``docs/decisions/unified_10m_grid.md``.
 COPDEM_COLLECTION = "COPERNICUS/DEM/GLO30_2024_1"
 COPDEM_RESOLUTION_M = 10.0
+
+#: ArcticDEM 2 m mosaic (EPSG:3413 polar stereographic), via Earth Engine.
+ARCTICDEM_ASSET = "UMN/PGC/ArcticDEM/V4/2m_mosaic"
+ARCTICDEM_BAND = "elevation"
+
+SOURCE_LABELS = {
+    "mrdem": "MRDEM-30 DTM (NRCan CanElevation, AWS COG)",
+    "arcticdem": f"ArcticDEM 2 m mosaic ({ARCTICDEM_ASSET}, GEE)",
+    "copernicus": "Copernicus DEM GLO-30 (COPERNICUS/DEM/GLO30_2024_1, GEE)",
+}
+DEFAULT_SOURCE_PRIORITY = ("arcticdem", "mrdem", "copernicus")
+
+#: Value masked pixels are unmasked to before an Earth Engine download, then
+#: turned back into NaN (an elevation is never exactly this).
+_EE_NODATA = -9999.0
 
 #: Minimum fraction of finite pixels in the fetched window for a source to be
 #: considered usable. Deliberately low: this only screens out windows that
@@ -143,7 +168,7 @@ def load_mrdem_dtm(
     MRDEM-30 is one nationwide mosaic COG in EPSG:3979, so this is a single
     windowed read -- no STAC search or per-tile mosaicking needed, unlike a
     genuinely tiled product. Returns ``None`` if the window has no usable
-    coverage. The read result is reprojected to :data:`TARGET_EPSG` at
+    coverage. The read result is reprojected to ``src_crs`` at
     ``target_resolution_m`` -- the pipeline's reference-grid resolution
     (``DemConfig.target_resolution_m``, default 10.0), not MRDEM-30's own
     native 30 m pixel spacing; genuine elevation detail is still only ~30 m,
@@ -162,7 +187,7 @@ def load_mrdem_dtm(
     if dem is None:
         return None
 
-    if dem.rio.crs.to_epsg() != TARGET_EPSG or target_resolution_m != MRDEM_RESOLUTION_M:
+    if dem.rio.crs.to_epsg() != src_crs or target_resolution_m != MRDEM_RESOLUTION_M:
         # An explicit dst transform/shape pins the reprojected grid to the
         # tile's own window bounds: passing only resolution/dst_crs sizes the
         # output to the *rotated* footprint of the source window (EPSG:3979
@@ -172,7 +197,7 @@ def load_mrdem_dtm(
         # back ~32-56% valid before this fix, depending on rotation).
         dst_transform, dst_width, dst_height = _window_transform(bounds, target_resolution_m)
         dem = dem.rio.reproject(
-            dst_crs=f"EPSG:{TARGET_EPSG}",
+            dst_crs=f"EPSG:{src_crs}",
             transform=dst_transform,
             shape=(dst_height, dst_width),
             resampling=Resampling.bilinear,
@@ -195,46 +220,32 @@ def _window_transform(
     return transform, width, height
 
 
-def load_copernicus_dem_gee(
+def _compute_pixels_window(
+    image,
     bounds: tuple[float, float, float, float],
-    src_crs: int = TARGET_EPSG,
-    collection: str = COPDEM_COLLECTION,
-    target_resolution_m: float = COPDEM_RESOLUTION_M,
+    src_crs: int,
+    target_resolution_m: float,
 ) -> Optional[xr.DataArray]:
-    """Load Copernicus GLO-30 over ``bounds`` (in ``src_crs``) via Earth Engine.
+    """Download ``image`` over ``bounds`` on the exact ``src_crs`` grid at
+    ``target_resolution_m`` with ``ee.data.computePixels``.
 
-    Built directly in ``src_crs`` (never as a reprojected lon/lat rectangle
-    handed to Earth Engine server-side) -- the same fix documented in
-    ``tiles/registry.py`` for the ~1.5 km grid-shift bug at this AOI's
-    latitude applies equally here.
-
-    ``target_resolution_m`` is the pipeline's reference-grid resolution
-    (``DemConfig.target_resolution_m``); GLO-30's own native pixel spacing is
-    still 30 m, so a finer target only changes pixel alignment, not genuine
-    resolving power (see ``docs/decisions/unified_10m_grid.md``).
-
-    ``Image.getDownloadURL`` returns an authenticated
-    ``.../:getPixels`` endpoint, not a plain public URL: GDAL's
-    ``/vsicurl/`` has no OAuth token to attach to it, so the request must go
-    through ``ee.data.computePixels`` (which carries the session's
-    credentials) rather than being opened directly with rasterio -- confirmed
-    live (a bare ``rasterio.open("/vsicurl/" + url)`` 404s: the endpoint
-    exists but rejects the unauthenticated GET).
+    The grid is built directly in ``src_crs`` (never a reprojected lon/lat
+    rectangle handed to Earth Engine server-side) -- the same fix documented in
+    ``tiles/registry.py`` for the ~1.5 km grid-shift bug at high latitude.
+    ``Image.getDownloadURL`` returns an authenticated ``.../:getPixels``
+    endpoint that GDAL's ``/vsicurl/`` cannot call (confirmed live: 404), so the
+    request goes through ``computePixels``, which carries the session's
+    credentials. Masked pixels come back as :data:`_EE_NODATA` -> NaN.
     """
     import io
 
     import ee
 
-    geom = ee.Geometry.Rectangle(
-        list(bounds), proj=f"EPSG:{src_crs}", evenOdd=True, geodesic=False
-    )
     dst_transform, dst_width, dst_height = _window_transform(bounds, target_resolution_m)
-    image = ee.ImageCollection(collection).select("DEM").mosaic().clip(geom)
-
     try:
         tiff_bytes = ee.data.computePixels(
             {
-                "expression": image,
+                "expression": image.toFloat().unmask(_EE_NODATA),
                 "fileFormat": "GEO_TIFF",
                 "grid": {
                     "dimensions": {"width": dst_width, "height": dst_height},
@@ -254,16 +265,15 @@ def load_copernicus_dem_gee(
         return None
 
     with rasterio.open(io.BytesIO(tiff_bytes)) as src:
-        arr = src.read(1, masked=True)
-        data = np.asarray(arr.filled(np.nan), dtype=np.float32)
+        data = np.asarray(src.read(1), dtype=np.float32)
+        data[data == np.float32(_EE_NODATA)] = np.nan
         if src.nodata is not None and np.isfinite(src.nodata):
             data[data == np.float32(src.nodata)] = np.nan
         result = _wrap_array(data, src.transform, src.crs.to_epsg() or src_crs)
 
-    if result.rio.crs.to_epsg() != TARGET_EPSG or target_resolution_m != COPDEM_RESOLUTION_M:
-        dst_transform, dst_width, dst_height = _window_transform(bounds, target_resolution_m)
+    if result.rio.crs.to_epsg() != src_crs:
         result = result.rio.reproject(
-            dst_crs=f"EPSG:{TARGET_EPSG}",
+            dst_crs=f"EPSG:{src_crs}",
             transform=dst_transform,
             shape=(dst_height, dst_width),
             resampling=Resampling.bilinear,
@@ -273,49 +283,131 @@ def load_copernicus_dem_gee(
     return result.astype("float32")
 
 
+def load_copernicus_dem_gee(
+    bounds: tuple[float, float, float, float],
+    src_crs: int = TARGET_EPSG,
+    collection: str = COPDEM_COLLECTION,
+    target_resolution_m: float = COPDEM_RESOLUTION_M,
+) -> Optional[xr.DataArray]:
+    """Load Copernicus GLO-30 over ``bounds`` (in ``src_crs``) via Earth Engine.
+
+    ``target_resolution_m`` is the pipeline's reference-grid resolution
+    (``DemConfig.target_resolution_m``); GLO-30's own native pixel spacing is
+    still 30 m, so a finer target only changes pixel alignment, not genuine
+    resolving power (see ``docs/decisions/unified_10m_grid.md``).
+    """
+    import ee
+
+    image = ee.ImageCollection(collection).select("DEM").mosaic()
+    return _compute_pixels_window(image, bounds, src_crs, target_resolution_m)
+
+
+def load_arcticdem_gee(
+    bounds: tuple[float, float, float, float],
+    src_crs: int = TARGET_EPSG,
+    asset: str = ARCTICDEM_ASSET,
+    target_resolution_m: float = 10.0,
+) -> Optional[xr.DataArray]:
+    """Load the ArcticDEM 2 m mosaic over ``bounds`` (in ``src_crs``) via Earth Engine.
+
+    The mosaic is requested directly on the ``target_resolution_m`` grid: Earth
+    Engine serves the coarser request from the asset's MEAN pyramid, i.e. the
+    mean of the 2 m pixels. Returns ``None`` outside ArcticDEM's footprint. A
+    DSM (canopy and ice surface included).
+    """
+    import ee
+
+    image = ee.Image(asset).select(ARCTICDEM_BAND)
+    return _compute_pixels_window(image, bounds, src_crs, target_resolution_m)
+
+
+def _load_source(
+    name: str,
+    bounds: tuple[float, float, float, float],
+    src_crs: int,
+    target_resolution_m: float,
+) -> Optional[xr.DataArray]:
+    """One named source, ``None`` on any failure or missing coverage."""
+    if name not in SOURCE_LABELS:
+        raise ValueError(f"Unknown DEM source {name!r}; expected one of {DEFAULT_SOURCE_PRIORITY}")
+    try:
+        if name == "mrdem":
+            return load_mrdem_dtm(bounds, src_crs=src_crs, target_resolution_m=target_resolution_m)
+        if name == "arcticdem":
+            return load_arcticdem_gee(bounds, src_crs=src_crs, target_resolution_m=target_resolution_m)
+        return load_copernicus_dem_gee(bounds, src_crs=src_crs, target_resolution_m=target_resolution_m)
+    except Exception:
+        return None
+
+
+#: Fewest common pixels needed to estimate the vertical offset between two sources.
+_MIN_OVERLAP_PX = 100
+
+
+def fill_gaps(
+    base: xr.DataArray, other: xr.DataArray
+) -> tuple[xr.DataArray, int, Optional[float]]:
+    """Fill ``base``'s NaN pixels from ``other`` (same grid).
+
+    ``other`` is first shifted by the median of ``base - other`` over their
+    common valid pixels (vertical datum / bias difference), when there are at
+    least :data:`_MIN_OVERLAP_PX` of them. Returns ``(filled, n_filled,
+    offset_m)``; ``offset_m`` is ``None`` if no shift could be estimated.
+    """
+    a = np.asarray(base.values, dtype=np.float32)
+    b = np.asarray(other.values, dtype=np.float32)
+    common = np.isfinite(a) & np.isfinite(b)
+    offset = float(np.median(a[common] - b[common])) if common.sum() >= _MIN_OVERLAP_PX else None
+    gap = ~np.isfinite(a) & np.isfinite(b)
+    out = np.where(gap, b + np.float32(offset or 0.0), a).astype(np.float32)
+    return base.copy(data=out), int(gap.sum()), offset
+
+
 def load_best_dem(
     bounds: tuple[float, float, float, float],
     src_crs: int = TARGET_EPSG,
     use_copernicus_fallback: bool = True,
     force_copernicus: bool = False,
     target_resolution_m: float = 10.0,
+    source_priority: Optional[Sequence[str]] = None,
+    min_valid_pct: float = 90.0,
 ) -> tuple[Optional[xr.DataArray], str, int, float]:
-    """Try MRDEM-30 DTM first, then Copernicus GLO-30.
+    """Walk the sources in ``source_priority`` and return the assembled DEM.
 
-    Returns ``(dem, source_label, base_resolution_m, valid_pct)``. ``dem`` is
-    ``None`` when neither source yields a window with at least
-    :data:`MIN_VALID_PCT` finite pixels. ``base_resolution_m`` is the
-    *output* grid resolution (``target_resolution_m``, normally
-    ``DemConfig.target_resolution_m``), not necessarily the source's own
-    native pixel spacing -- both MRDEM-30 and Copernicus GLO-30 are natively
-    30 m; see ``docs/decisions/unified_10m_grid.md``.
+    The first source with at least :data:`MIN_VALID_PCT` valid pixels is taken;
+    while the result is below ``min_valid_pct`` valid, the next sources fill its
+    gaps pixel by pixel (see :func:`fill_gaps`). Returns ``(dem, source_label,
+    base_resolution_m, valid_pct)``; ``dem`` is ``None`` when no source yields a
+    usable window. ``base_resolution_m`` is the *output* grid resolution
+    (``target_resolution_m``); the sources' native spacing is 30 m (MRDEM,
+    GLO-30) or 2 m (ArcticDEM), see ``docs/decisions/unified_10m_grid.md``.
 
-    ``force_copernicus`` skips MRDEM entirely and goes straight to
-    Copernicus GLO-30, so the fallback path can be exercised deliberately.
+    ``force_copernicus`` uses Copernicus alone; ``use_copernicus_fallback=False``
+    drops it from the list (fail loud rather than substitute a canopy-biased
+    source).
     """
-    if not force_copernicus:
-        try:
-            dem = load_mrdem_dtm(bounds, src_crs=src_crs, target_resolution_m=target_resolution_m)
-        except Exception:
-            dem = None
+    order = list(source_priority) if source_priority else list(DEFAULT_SOURCE_PRIORITY)
+    if force_copernicus:
+        order = ["copernicus"]
+    elif not use_copernicus_fallback:
+        order = [n for n in order if n != "copernicus"]
 
-        if dem is not None:
-            pct = valid_fraction_pct(dem)
-            if pct >= MIN_VALID_PCT:
-                return dem, "MRDEM-30 DTM (NRCan CanElevation, AWS COG)", target_resolution_m, pct
+    merged: Optional[xr.DataArray] = None
+    parts: list[str] = []
+    for name in order:
+        dem = _load_source(name, bounds, src_crs, target_resolution_m)
+        if dem is None or valid_fraction_pct(dem) < MIN_VALID_PCT:
+            continue
+        if merged is None:
+            merged, parts = dem, [SOURCE_LABELS[name]]
+        else:
+            merged, n_filled, offset = fill_gaps(merged, dem)
+            if n_filled:
+                shift = f"shifted {offset:+.1f} m" if offset is not None else "unshifted, little overlap"
+                parts.append(f"{SOURCE_LABELS[name]} [gap fill: {n_filled} px, {shift}]")
+        if valid_fraction_pct(merged) >= min_valid_pct:
+            break
 
-    if not use_copernicus_fallback and not force_copernicus:
+    if merged is None:
         return None, "", 0, 0.0
-
-    try:
-        dem = load_copernicus_dem_gee(bounds, src_crs=src_crs, target_resolution_m=target_resolution_m)
-    except Exception:
-        dem = None
-
-    if dem is None:
-        return None, "", 0, 0.0
-
-    pct = valid_fraction_pct(dem)
-    if pct < MIN_VALID_PCT:
-        return None, "", 0, pct
-    return dem, "Copernicus DEM GLO-30 (COPERNICUS/DEM/GLO30_2024_1, GEE)", target_resolution_m, pct
+    return merged, " + ".join(parts), target_resolution_m, valid_fraction_pct(merged)

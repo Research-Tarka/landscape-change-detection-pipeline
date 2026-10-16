@@ -3,8 +3,9 @@
 
 Purpose
 -------
-Cover the AOI (``config.tiles.aoi_path``) with a regular grid of square
-tiles, write the tile registry, then distribute tiles across
+Cover the AOI source(s) (``config.tiles.aoi_sources``, or the legacy
+``aoi_path``) with square tiles (grid / one per feature / auto, see
+``tiles/registry.py``), write the tile registry, then distribute tiles across
 ``config.tiles.n_splits`` batches (one batch per parallel GEE
 project/worker used by later download/inference stages) via the
 area-balanced LPT splitter.
@@ -24,7 +25,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from landscape_change_detection_pipeline.config import load_config  # noqa: E402
-from landscape_change_detection_pipeline.tiles.registry import build_registry, write_registry  # noqa: E402
+from landscape_change_detection_pipeline.tiles.registry import (  # noqa: E402
+    build_registry_from_specs,
+    specs_from_config,
+    summarize_registry,
+    write_registry,
+)
 from landscape_change_detection_pipeline.tiles.splitter import (  # noqa: E402
     assign_lpt,
     assignment_table,
@@ -43,7 +49,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         nargs=4,
         default=None,
         metavar=("MINX", "MINY", "MAXX", "MAXY"),
-        help="Restrict tiling to this bbox (aoi_crs units), overriding config.tiles.pilot_bbox",
+        help="Restrict tiling to this bbox (in tiles.pilot_bbox_crs, else the source CRS), "
+        "overriding config.tiles.pilot_bbox",
     )
     return parser.parse_args(argv)
 
@@ -55,19 +62,21 @@ def main(argv: list[str] | None = None) -> int:
 
     pilot_bbox = args.pilot_bbox if args.pilot_bbox is not None else tiles_cfg.pilot_bbox
 
-    print(f"[tiles] building registry from AOI '{tiles_cfg.aoi_path}' (layer={tiles_cfg.aoi_layer})")
-    registry = build_registry(
-        tiles_cfg.aoi_path,
-        tiles_cfg.aoi_layer,
-        tiles_cfg.aoi_crs,
-        tile_size_m=tiles_cfg.tile_size_m,
+    specs = specs_from_config(tiles_cfg)
+    for spec, path in specs:
+        print(f"[tiles] source '{spec.name}': {path} (mode={spec.mode}, crs={spec.crs}, "
+              f"tile={spec.tile_size_m:g} m, max={spec.max_tile_size_m:g} m)")
+    registry = build_registry_from_specs(
+        specs,
         buffer_m=tiles_cfg.buffer_m,
+        grid_anchor=tiles_cfg.grid_anchor,
         pilot_bbox=pilot_bbox,
+        pilot_bbox_crs=tiles_cfg.pilot_bbox_crs,
         pilot_bbox_requires_aoi_overlap=tiles_cfg.pilot_bbox_requires_aoi_overlap,
-        tile_id_prefix=tiles_cfg.tile_id_prefix,
     )
     out_path = write_registry(registry, tiles_cfg.registry_path)
     print(f"[tiles] wrote {len(registry)} tiles to {out_path}")
+    print(summarize_registry(registry).to_string(index=False))
 
     loads = assign_lpt(
         registry["tile_id"].tolist(),

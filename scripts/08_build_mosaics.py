@@ -40,6 +40,7 @@ from landscape_change_detection_pipeline.mosaic.mosaic import (  # noqa: E402
     build_period_mosaic,
     discover_periods,
     load_period_tile_composites,
+    mosaic_groups,
     mosaic_output_path,
     write_mosaic,
 )
@@ -64,15 +65,22 @@ def _build_one_period(
     a worker process. Returns ``(period, result_summary_or_None)`` --
     ``None`` when skipped (already written, or no tile composite found for
     this period), so the caller does all printing/counting."""
-    out_path = mosaic_output_path(output_root, period)
-    if out_path.is_file() and not overwrite:
+    n_tiles = 0
+    resolution_m = None
+    for aoi_id, group in mosaic_groups(registry):
+        out_path = mosaic_output_path(output_root, period, aoi_id)
+        if out_path.is_file() and not overwrite:
+            continue
+        tiles = load_period_tile_composites(composites_root, group, period)
+        if not tiles:
+            continue
+        result = build_period_mosaic(tiles, group)
+        write_mosaic(out_path, result)
+        n_tiles += len(result["tiles_present"])
+        resolution_m = result["resolution_m"] if resolution_m is None else min(resolution_m, result["resolution_m"])
+    if resolution_m is None:
         return period, None
-    tiles = load_period_tile_composites(composites_root, registry, period)
-    if not tiles:
-        return period, None
-    result = build_period_mosaic(tiles, registry)
-    write_mosaic(out_path, result)
-    return period, {"n_tiles": len(result["tiles_present"]), "resolution_m": result["resolution_m"]}
+    return period, {"n_tiles": n_tiles, "resolution_m": resolution_m}
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -4,12 +4,10 @@
 Purpose
 -------
 For every tile in the registry (Stage 1), fetch the best available source
-DEM over the tile's buffered analysis window (MRDEM-30 DTM, Copernicus
-GLO-30 fallback), derive slope/aspect, and write everything into the tile's
-zarr store. The Copernicus fallback is served through Earth Engine
-(``COPERNICUS/DEM/GLO30_2024_1``), so a GEE project is initialized once
-up front even though most tiles are expected to resolve via the direct
-MRDEM-30 COG path and never touch it.
+DEM over the tile's buffered analysis window (priority list ``dem.source_priority``:
+MRDEM-30 DTM, ArcticDEM, Copernicus GLO-30), derive slope/aspect, and write everything into the tile's
+zarr store. ArcticDEM and Copernicus are served through Earth Engine, so a GEE project
+is initialized once up front even for tiles resolved by the direct MRDEM-30 COG path.
 
 Usage
 -----
@@ -38,7 +36,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--env-file", default=None, help="Path to a .env file")
     parser.add_argument("--tiles", default=None, help="Comma-separated tile_ids to restrict to")
     parser.add_argument("--overwrite", action="store_true", help="Recompute tiles already marked done")
-    parser.add_argument("--ee-project", default=None, help="GEE project for the Copernicus GLO-30 fallback")
+    parser.add_argument("--ee-project", default=None, help="GEE project for ArcticDEM / Copernicus GLO-30")
     return parser.parse_args(argv)
 
 
@@ -61,6 +59,8 @@ def main(argv: list[str] | None = None) -> int:
         copernicus_fallback=dem_cfg.use_copernicus_fallback,
         force_copernicus=dem_cfg.force_copernicus,
         target_resolution_m=dem_cfg.target_resolution_m,
+        source_priority=dem_cfg.source_priority,
+        min_valid_pct=dem_cfg.min_valid_pct,
     )
 
     n_ok = sum(1 for _, status in results if status == "ok")
