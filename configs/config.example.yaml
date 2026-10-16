@@ -182,6 +182,7 @@ features:
   # after changing.
   include_doy_features: true            # adds doy_sin/doy_cos (cyclical day-of-year, from each scene's acquisition date)
   include_latlon_features: false        # adds lat_norm/lon_norm (each scene's centroid, normalized to roughly [-1, 1])
+  include_illumination_features: false  # adds illum_cos/terrain_shadow (sun incidence on the slope + terrain shadow). Changes the input channel count: re-export the cache and retrain
 
 # ----------------------------------------------------------------------
 # Train/val/test split
@@ -360,6 +361,8 @@ training:
   # rare_classes lists below (a warning is printed otherwise). {} = off.
   class_merge:
     built_up_infrastructure: bare_ground   # 1-2 px objects: below sensor resolution, never learned
+    # firn: ice_cover                      # optional: firn is spectrally continuous with ice/snow
+    # rock_alpine_bare: bare_ground       # optional
   class_weighting: true                 # inverse-frequency class weights in the loss -- rare classes learn poorly without this
   class_weight_power: 0.5               # weight = inverse_freq ** power; 1.0 = plain (can reach x100+ and break training), 0.5 = sqrt
   class_weight_max: 10.0                # cap on any single class weight; null = no cap

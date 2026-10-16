@@ -1145,7 +1145,10 @@ def _train_model(
                 f"({time.time() - started:.1f}s)"
             )
 
-        improved = math.isfinite(score) and score > best_score
+        # Ties (the metric is rounded to 3 decimals) are broken on val_loss: at equal mIoU, the
+        # lower-loss epoch is the better-calibrated one.
+        best_val_loss = best_state.get("val_loss", math.inf) if best_state else math.inf
+        improved = math.isfinite(score) and (score > best_score or (score == best_score and val_loss < best_val_loss))
         if improved:
             best_score = score
             best_epoch = epoch
