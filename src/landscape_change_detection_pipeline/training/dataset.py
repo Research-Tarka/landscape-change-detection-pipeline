@@ -238,6 +238,112 @@ def _stratify_by_size(
     return sorted(train), sorted(val), sorted(test)
 
 
+def _balance_partitions(
+    tile_groups: Mapping[str, list[int]],
+    class_counts: Sequence[np.ndarray],
+    scene_sensors: Sequence[str],
+    train: list[str],
+    val: list[str],
+    test: list[str],
+    ratios: tuple[float, float, float],
+    seed: int,
+    iterations: int = 60000,
+) -> tuple[float, float]:
+    """Swap/move whole tiles so every partition holds about its configured share
+    of **each** class's pixels, and of each sensor's scenes.
+
+    The stratified shuffle only balances tile *counts*, but class pixels are
+    concentrated in a few tiles (e.g. 77 % of burned pixels sit in 4 tiles), so a
+    random split can leave a class with almost nothing in val/test. This is a
+    seeded simulated-annealing pass over the tile assignment minimising
+    ``sum_{p,k} ((share_pk - ratio_p) / ratio_p) ** 2`` over the active classes plus
+    one column per sensor and one for the scene count (so the sensor mix and the
+    scene proportions stay comparable too). Relative errors are used, so a rare class
+    counts as much as a common one. Partitions with ratio 0 stay empty and no
+    partition (train included) is ever left empty. Tile exclusivity is untouched:
+    whole groups move. Lists are modified in place, kept sorted.
+
+    Returns ``(cost_before, cost_after)``.
+    """
+    tiles = sorted(tile_groups)
+    parts = [i for i, r in enumerate(ratios) if r > 0]
+    if len(tiles) < len(parts) or len(parts) < 2:
+        return 0.0, 0.0
+    sensors = sorted(set(scene_sensors))
+    num_classes = len(class_counts[0])
+    columns = []
+    for tid in tiles:
+        idx = tile_groups[tid]
+        pixels = sum((np.asarray(class_counts[i], dtype=np.float64) for i in idx), start=np.zeros(num_classes))
+        per_sensor = np.array([sum(scene_sensors[i] == s for i in idx) for s in sensors], dtype=np.float64)
+        columns.append(np.concatenate([pixels, per_sensor, [float(len(idx))]]))
+    data = np.stack(columns)  # (G, K)
+    totals = data.sum(0)
+    active = totals > 0
+    data, totals = data[:, active], totals[active]
+    ratio = np.array([ratios[i] for i in parts], dtype=np.float64)
+
+    position = {tid: n for n, tid in enumerate(tiles)}
+    lookup = {0: train, 1: val, 2: test}
+    assign = np.zeros(len(tiles), dtype=np.int64)  # index into `parts`
+    for n, part in enumerate(parts):
+        for tid in lookup[part]:
+            assign[position[tid]] = n
+
+    sums = np.zeros((len(parts), data.shape[1]))
+    for g, n in enumerate(assign):
+        sums[n] += data[g]
+    sizes = np.bincount(assign, minlength=len(parts))
+
+    def row_cost(n: int, row: np.ndarray) -> float:
+        return float((((row / totals - ratio[n]) / ratio[n]) ** 2).sum())
+
+    costs = np.array([row_cost(n, sums[n]) for n in range(len(parts))])
+    before = float(costs.sum())
+    best_cost, best_assign = before, assign.copy()
+    rng = random.Random(seed + 1)
+    temperature0, temperature1 = 0.3, 0.002
+
+    for step in range(iterations):
+        temperature = temperature0 * (temperature1 / temperature0) ** (step / iterations)
+        g = rng.randrange(len(tiles))
+        a = int(assign[g])
+        if rng.random() < 0.5:  # move one tile
+            b = rng.randrange(len(parts))
+            if b == a or sizes[a] <= 1:
+                continue
+            new_a, new_b = sums[a] - data[g], sums[b] + data[g]
+            delta = row_cost(a, new_a) + row_cost(b, new_b) - costs[a] - costs[b]
+            if delta <= 0 or rng.random() < np.exp(-delta / temperature):
+                sums[a], sums[b] = new_a, new_b
+                costs[a], costs[b] = row_cost(a, new_a), row_cost(b, new_b)
+                sizes[a] -= 1
+                sizes[b] += 1
+                assign[g] = b
+        else:  # swap two tiles
+            h = rng.randrange(len(tiles))
+            b = int(assign[h])
+            if a == b:
+                continue
+            new_a, new_b = sums[a] - data[g] + data[h], sums[b] - data[h] + data[g]
+            delta = row_cost(a, new_a) + row_cost(b, new_b) - costs[a] - costs[b]
+            if delta <= 0 or rng.random() < np.exp(-delta / temperature):
+                sums[a], sums[b] = new_a, new_b
+                costs[a], costs[b] = row_cost(a, new_a), row_cost(b, new_b)
+                assign[g], assign[h] = b, a
+        total = float(costs.sum())
+        if total < best_cost:
+            best_cost, best_assign = total, assign.copy()
+
+    for part in parts:
+        lookup[part].clear()
+    for g, n in enumerate(best_assign):
+        lookup[parts[int(n)]].append(tiles[g])
+    for part in parts:
+        lookup[part].sort()
+    return before, best_cost
+
+
 def _enforce_sensor_coverage(
     tile_groups: Mapping[str, list[int]],
     scene_sensors: Sequence[str],
@@ -506,6 +612,7 @@ def split_scenes(
     ratios: tuple[float, float, float] = DEFAULT_RATIOS,
     split_seed: int = 0,
     split_by: str = "tile",
+    balance_classes: bool = True,
 ) -> SplitResult:
     """Split annotated scenes into train/val/test, by whole tile or by
     individual scene (see ``split_by``).
@@ -539,6 +646,10 @@ def split_scenes(
         ``config.py::SplitConfig.split_by``'s docstring for the full
         rationale; behaviour is otherwise identical (same stratification,
         same three coverage-repair passes, same warnings).
+    balance_classes:
+        After the stratified shuffle, run :func:`_balance_partitions` so each
+        partition holds about its configured share of every class's pixels (and
+        of every sensor's scenes). On by default; pass False to reproduce a historical split.
 
     Returns
     -------
@@ -579,6 +690,14 @@ def split_scenes(
     warnings = _enforce_sensor_class_coverage(
         tile_groups, class_counts, scene_sensors, num_classes, train, val, test, val_ratio, test_ratio
     )
+
+    if balance_classes:
+        # Last, so the coverage passes above (which move big tiles around) cannot undo it; an
+        # empty class/sensor in a partition costs (-1)^2 per column, so it stays covered.
+        before, after = _balance_partitions(
+            tile_groups, class_counts, scene_sensors, train, val, test, tuple(ratios), split_seed
+        )
+        logger.info("[split] class balancing: imbalance cost %.3f -> %.3f", before, after)
 
     _check_tile_exclusivity(train, val, test)
     warnings = warnings + _proportion_warnings(train, val, test, tile_groups, val_ratio, test_ratio)

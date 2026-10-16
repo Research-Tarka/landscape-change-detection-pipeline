@@ -191,6 +191,7 @@ split:
   ratios: [0.7, 0.15, 0.15]             # [train, val, test], must sum to 1.0
   split_seed: 0                         # seeded stratified shuffle -> reproducible split
   split_by: scene                       # tile (default, leakage-safe) | scene -- scene allows scenes from the same tile to land in different partitions
+  balance_classes: true                 # after the random split, swap whole tiles so every partition holds ~its ratio of EACH class's pixels and of each sensor's scenes
   drift_tolerance: 0.25                 # warn (never fail) if a partition's actual ratio drifts more than this fraction of target
   split_assignment_path: data/train_cache/split_assignment.json
 
@@ -527,6 +528,17 @@ composites:
   # Raw class ids (classes.yaml `id`), not dense. Transient states fill in only
   # where nothing else won the month's majority; precedence (lower priority wins):
   # any other class (not cloud/shadow) > ice > firn > snow (worst state wins).
+  # Worst-state rule (fallback_occurrence classes): a class must appear in at
+  # least min_count clear scenes of the month to be kept as the pixel's worst
+  # state, else the next less severe present class is taken (1 snow + 1 ice ->
+  # snow; 1 snow + 2 ice -> ice). Capped by the pixel's clear observations, so
+  # a lone observation is taken as is. Per-class `min_count` overrides this.
+  worst_state_min_count: 2
+  # Per-class `doy_start`/`doy_end` (day of year, inclusive; start > end wraps
+  # the new year; omit = all year) restrict the worst-state rule to that window
+  # (checked on the month's mid-month DOY); outside it the class is voted like
+  # any other (median). E.g. 152-273 (Jun-Sep) keeps snow from appearing off a
+  # single scene in summer where there is no glacier.
   class_rules:
     - class_id: 8   # snow_cover
       rule: fallback_occurrence

@@ -103,7 +103,7 @@ For every mask MaskForge wrote (`data/masks/<tile>_<sensor>_<scene>/mask.tif`), 
 Which indices go in the model is `features.index_names` in the config. **Changing it changes the model's input size: re-run 04, then 05.** `scripts/export_georeferenced_cache.py` writes the cache back out as plain GeoTIFFs for a visual check in QGIS.
 
 ### 05 Split + training: `05_train_model.py`
-Splits annotated scenes into train / val / test (`split.split_by`: `tile` is leakage-safe, `scene` is looser and lets two dates of the same tile land in different partitions, so the validation score is then optimistic), with repair passes so each partition sees every sensor and class. Then trains `model.type`.
+Splits annotated scenes into train / val / test (`split.split_by`: `tile` is leakage-safe, `scene` is looser and lets two dates of the same tile land in different partitions, so the validation score is then optimistic), with repair passes so each partition sees every sensor and class, then (`split.balance_classes`, on by default) a tile-swapping pass so each partition holds about its configured share of every class's pixels and of every sensor's scenes. Then trains `model.type`.
 
 **The two supported models are `unet` and `catboost`.** The other types (`threshold`, `random_forest`, `lightgbm`, `deeplabv3plus`, `segformer`) are still in the code but have not been set up or tuned; if you switch to one, expect to do that work yourself. New analysis tools (05c) refuse them explicitly.
 

@@ -109,6 +109,7 @@ def main(argv: list[str] | None = None) -> int:
         ratios=tuple(config.split.ratios),
         split_seed=config.split.split_seed,
         split_by=config.split.split_by,
+        balance_classes=config.split.balance_classes,
     )
     train_records = split_result.scenes_by_partition["train"]
     val_records = split_result.scenes_by_partition["val"]

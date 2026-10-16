@@ -435,6 +435,7 @@ def main(argv: list[str] | None = None) -> int:
     parts = split_scenes(
         records, counts, num_classes, ratios=tuple(config.split.ratios),
         split_seed=config.split.split_seed, split_by=config.split.split_by,
+        balance_classes=config.split.balance_classes,
     ).scenes_by_partition
     train_r, val_r = list(parts["train"]), list(parts[fi.split])
     if not val_r:

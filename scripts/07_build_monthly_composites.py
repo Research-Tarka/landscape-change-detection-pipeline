@@ -78,6 +78,7 @@ def _build_one_tile(
     class_rules: dict[int, tuple[str, int]],
     ignore_class_ids: tuple[int, ...],
     overwrite: bool,
+    worst_state_opts: dict,
     progress_queue: "multiprocessing.Queue | None",
 ) -> tuple[str, int]:
     """One tile's full ``build_all_monthly_composites`` call, run in a worker
@@ -101,6 +102,7 @@ def _build_one_tile(
         overwrite=overwrite,
         progress_callback=callback,
         ignore_class_ids=ignore_class_ids,
+        worst_state_opts=worst_state_opts,
     )
     return tile_id, len(written)
 
@@ -119,6 +121,16 @@ def main(argv: list[str] | None = None) -> int:
 
     class_rules = {rule.class_id: (rule.rule, rule.priority) for rule in comp_cfg.class_rules}
 
+    worst_state_opts = {
+        rule.class_id: (
+            rule.min_count if rule.min_count is not None else comp_cfg.worst_state_min_count,
+            rule.doy_start,
+            rule.doy_end,
+        )
+        for rule in comp_cfg.class_rules
+        if rule.rule == "fallback_occurrence"
+    }
+
     registry = read_registry(config.tiles.registry_path)
     tile_ids = comp_cfg.tiles or registry["tile_id"].tolist()
 
@@ -131,6 +143,7 @@ def main(argv: list[str] | None = None) -> int:
         class_rules,
         ignore_class_ids,
         comp_cfg.overwrite,
+        worst_state_opts,
     )
 
     total_written = 0

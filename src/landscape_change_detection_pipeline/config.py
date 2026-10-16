@@ -484,6 +484,7 @@ class SplitConfig(BaseModel):
     drift_tolerance: float = 0.25
     split_assignment_path: str = "data/train_cache/split_assignment.json"
     split_by: str = "tile"
+    balance_classes: bool = True
 
     @field_validator("split_by")
     @classmethod
@@ -1175,6 +1176,15 @@ class CompositeClassRule(BaseModel):
     class_id: int
     rule: str = "median"
     priority: int = 0
+    #: ``fallback_occurrence`` only. Min number of clear scenes a class must
+    #: appear in to be retained as a pixel's worst state (None = use
+    #: ``composites.worst_state_min_count``).
+    min_count: Optional[int] = None
+    #: ``fallback_occurrence`` only. Day-of-year window (inclusive, start > end
+    #: wraps the new year) in which the class uses the worst-state rule; outside
+    #: it, it is an ordinary voted (median) class. None = all year.
+    doy_start: Optional[int] = None
+    doy_end: Optional[int] = None
 
     @field_validator("rule")
     @classmethod
@@ -1202,6 +1212,8 @@ class CompositesConfig(BaseModel):
         default_factory=lambda: ["s2", "l9", "l8", "l7", "l5"]
     )
     default_rule: str = "median"
+    worst_state_min_count: int = 2
+    """Default ``min_count`` for ``fallback_occurrence`` (worst-state) classes."""
     class_rules: list[CompositeClassRule] = Field(default_factory=list)
     ignore_classes: list[str] = Field(default_factory=lambda: ["cloud", "shadow"])
     """Class names (classes.yaml) that cast no vote in a monthly composite, so a

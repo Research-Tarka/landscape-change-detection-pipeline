@@ -140,6 +140,9 @@ def build_tile_snow_water_dynamics(
     ice_id = class_config.by_name("ice_cover").id
     water_id = class_config.by_name("open_water").id
     firn_id = class_config.by_name("firn").id if any(c.name == "firn" for c in class_config.classes) else None
+    # cloud/shadow (change_eligible=False) never count as an observation, even if
+    # composites.ignore_classes let them through into a composite.
+    unobservable_ids = [c.id for c in class_config.classes if not c.change_eligible]
 
     reference = read_composite(composite_output_path(composites_root, tile_id, periods[0]))
     dst_transform, dst_crs_wkt = reference["transform"], reference["crs_wkt"]
@@ -168,7 +171,7 @@ def build_tile_snow_water_dynamics(
                     class_map, composite["transform"], composite["crs_wkt"],
                     dst_transform, dst_crs_wkt, dst_shape, fill_value=composite["nodata"],
                 )
-            valid = class_map != composite["nodata"]
+            valid = (class_map != composite["nodata"]) & ~np.isin(class_map, unobservable_ids)
             n_observed[yi] += valid
 
             is_snow = valid & (class_map == snow_id)

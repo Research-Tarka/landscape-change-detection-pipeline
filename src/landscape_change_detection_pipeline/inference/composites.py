@@ -276,8 +276,24 @@ def build_monthly_composite(
     class_rules: dict[int, tuple[str, int]],
     nodata: int = 255,
     ignore_class_ids: tuple[int, ...] = (),
+    worst_state_opts: Optional[dict[int, tuple[int, Optional[int], Optional[int]]]] = None,
 ) -> dict:
     """Reduce one tile-month's scene class maps to one composite.
+
+    ``worst_state_opts`` is ``{class_id: (min_count, doy_start, doy_end)}`` for
+    ``fallback_occurrence`` classes (missing class -> min_count 1, all year):
+
+    - ``doy_start``/``doy_end`` (day of year, inclusive, may wrap the new year
+      e.g. 300..60; ``None`` = all year): the month's mid-month DOY must fall
+      in the window for the class to use the worst-state rule. Outside it the
+      class is voted like any stable class (median), so e.g. snow/ice cannot
+      appear from a single scene in summer.
+    - ``min_count``: a class is only retained as the "worst state" of a pixel
+      if it appears in at least that many clear scenes. Classes failing it
+      are skipped and the least severe present one is taken instead (1 snow +
+      1 ice, min 2 -> snow; 1 snow + 2 ice -> ice). The threshold is capped by
+      the pixel's number of clear observations, so a lone observation is
+      simply taken as is.
 
     ``ignore_class_ids``: raw class ids whose pixels cast no vote at all
     (treated as nodata) -- typically cloud/shadow, so a month is decided by
@@ -301,7 +317,18 @@ def build_monthly_composite(
     # class" present in the month beats them, however few scenes show it. They
     # are excluded from the majority denominator, so a pixel is only left to
     # them when no other class won.
-    fallback_ids = [c for c in range(num_classes) if class_rules.get(c, (default_rule, 0))[0] == "fallback_occurrence"]
+    worst_state_opts = worst_state_opts or {}
+    mid_doy = _mid_month_doy(scenes[0].year, scenes[0].month)
+
+    def _rule_of(class_id: int) -> tuple[str, int]:
+        rule, priority = class_rules.get(class_id, (default_rule, 0))
+        if rule == "fallback_occurrence":
+            _, doy_start, doy_end = worst_state_opts.get(class_id, (1, None, None))
+            if not _doy_in_window(mid_doy, doy_start, doy_end):
+                rule = "median"  # outside its DOY window: an ordinary voted class
+        return rule, priority
+
+    fallback_ids = [c for c in range(num_classes) if _rule_of(c)[0] == "fallback_occurrence"]
     votes_valid = counts.sum(axis=0) - counts[fallback_ids].sum(axis=0) if fallback_ids else counts.sum(axis=0)
 
     any_occurrence_hits: list[tuple[int, int, np.ndarray]] = []  # (priority, class_id, mask)
@@ -314,15 +341,14 @@ def build_monthly_composite(
     median_winner = np.full((height, width), -1, dtype=np.int32)
 
     for class_id in range(num_classes):
-        rule, priority = class_rules.get(class_id, (default_rule, 0))
+        rule, priority = _rule_of(class_id)
         if rule == "any_occurrence":
             mask = _any_occurrence_reduce_from_counts(counts, class_id)
             if mask.any():
                 any_occurrence_hits.append((priority, class_id, mask))
         elif rule == "fallback_occurrence":
-            mask = _any_occurrence_reduce_from_counts(counts, class_id)
-            if mask.any():
-                fallback_occurrence_hits.append((priority, class_id, mask))
+            if (counts[class_id] > 0).any():
+                fallback_occurrence_hits.append((priority, class_id, counts[class_id]))
         else:
             mask = _median_reduce_from_counts(counts, class_id, votes_valid)
             median_winner = np.where(mask, class_id, median_winner)
@@ -335,9 +361,22 @@ def build_monthly_composite(
     # snow/ice observation must not mask a real land-cover class that a
     # majority of the month's scenes actually agree on).
     unresolved = median_winner < 0
-    # Worst state wins: priority 1 (ice) is written last, then firn, then snow.
-    for priority, class_id, mask in sorted(fallback_occurrence_hits, key=lambda t: -t[0]):
-        composite = np.where(unresolved & mask, class_id, composite).astype(np.uint8)
+    # Worst state wins among classes seen in >= min_count clear scenes
+    # (priority 1 = ice is written last, after firn, after snow). The min_count
+    # is capped by the pixel's clear-observation count. A pixel where no class
+    # reaches it takes the least severe present class (highest priority number).
+    if fallback_occurrence_hits:
+        total_votes = counts.sum(axis=0)
+        strict = np.full((height, width), -1, dtype=np.int32)
+        loose = np.full((height, width), -1, dtype=np.int32)
+        for priority, class_id, class_counts in sorted(fallback_occurrence_hits, key=lambda t: -t[0]):
+            min_count = worst_state_opts.get(class_id, (1, None, None))[0]
+            reached = (class_counts > 0) & (class_counts >= np.minimum(min_count, total_votes))
+            strict = np.where(reached, class_id, strict)
+        for priority, class_id, class_counts in sorted(fallback_occurrence_hits, key=lambda t: t[0]):
+            loose = np.where(class_counts > 0, class_id, loose)
+        worst = np.where(strict >= 0, strict, loose)
+        composite = np.where(unresolved & (worst >= 0), worst, composite).astype(np.uint8)
 
     # any_occurrence classes override the median (and fallback_occurrence)
     # result wherever they fire, highest priority (lowest number) last so it
@@ -363,6 +402,22 @@ def build_monthly_composite(
         "sensors_present": sensors_present,
         "nodata": nodata,
     }
+
+
+def _mid_month_doy(year: int, month: int) -> int:
+    import datetime
+
+    return datetime.date(year, month, 15).timetuple().tm_yday
+
+
+def _doy_in_window(doy: int, start: Optional[int], end: Optional[int]) -> bool:
+    """Inclusive day-of-year window; ``start > end`` wraps the new year;
+    either bound ``None`` = no restriction."""
+    if start is None or end is None:
+        return True
+    if start <= end:
+        return start <= doy <= end
+    return doy >= start or doy <= end
 
 
 def composite_output_path(output_root: str | Path, tile_id: str, month: str) -> Path:
@@ -412,6 +467,7 @@ def build_all_monthly_composites(
     overwrite: bool = False,
     progress_callback=None,
     ignore_class_ids: tuple[int, ...] = (),
+    worst_state_opts: Optional[dict[int, tuple[int, Optional[int], Optional[int]]]] = None,
 ) -> list[Path]:
     """Build every tile-month composite available for one tile. Returns the
     paths actually (re)written.
@@ -437,7 +493,7 @@ def build_all_monthly_composites(
         else:
             result = build_monthly_composite(
                 groups[month], num_classes, sensor_priority, default_rule, class_rules, nodata,
-                ignore_class_ids,
+                ignore_class_ids, worst_state_opts,
             )
             write_composite(out_path, result)
             written.append(out_path)
