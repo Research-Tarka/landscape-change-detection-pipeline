@@ -53,6 +53,10 @@ dependencies:
   # pipeline's .npz rasters.
   - streamlit=1.59.1
   - matplotlib=3.11.2
+  # Interactive map preview in scripts/export_gui.py.
+  - folium=0.20.0
+  # HTTP downloads of GEE-exported scenes (scenes/gee_fetch.py).
+  - requests=2.34.2
   # Per-pixel temporal segmentation kernel (change/segmentation.py) --
   # JIT-compiled, parallelised across pixels.
   - numba=0.67.0

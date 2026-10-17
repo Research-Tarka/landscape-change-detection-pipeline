@@ -18,6 +18,17 @@ pip install -r requirements-torch.txt
 pip install -e .
 ```
 
+Updating an existing install after a `git pull` (new or changed dependencies):
+
+```
+conda env update -n landscape-change-detection-pipeline -f environment.yml --prune
+conda activate landscape-change-detection-pipeline
+pip install -r requirements-torch.txt
+pip install -e .
+```
+
+If conda reports solver conflicts (common with GDAL on Windows), recreate the env instead: `conda env remove -n landscape-change-detection-pipeline`, then redo the install steps above.
+
 Copy `.env.example` to `.env` and `configs/config.example.yaml` to `configs/config.yaml`, then fill in your paths and Earth Engine projects. Both files are gitignored (machine-specific). **`config.example.yaml` is the only config tracked by git**: whenever you add a setting, add it to `config.py` (pydantic), `config.example.yaml` **and** your own `config.yaml`.
 
 Earth Engine, once:

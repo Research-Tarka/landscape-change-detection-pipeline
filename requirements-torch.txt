@@ -92,3 +92,10 @@ catboost==1.2.10
 #
 #   pip install lightgbm
 lightgbm==4.7.0
+
+# Per-pixel temporal segmentation / event typing / persistence kernels
+# (change/*.py, JIT via numba.njit). Also pinned in environment.yml (conda);
+# listed here so a pip-only install does not miss it. llvmlite comes with it.
+numba==0.67.0
+folium==0.20.0
+requests==2.34.2

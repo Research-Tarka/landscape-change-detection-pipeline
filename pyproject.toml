@@ -9,6 +9,44 @@ description = "Satellite-based landscape classification and change detection pip
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
+# Floors/ceilings only; exact tested pins live in environment.yml and
+# requirements-torch.txt (conda-forge is the supported install route for the
+# geospatial stack: GDAL/rasterio/pyproj).
+dependencies = [
+    "numpy>=2.0",
+    "pandas>=2.2",
+    "scipy",
+    "scikit-learn",
+    "numba>=0.60",
+    "joblib",
+    "pyarrow",
+    "pyyaml",
+    "tqdm",
+    "pillow",
+    "requests",
+    "python-dotenv",
+    "pydantic>=2",
+    "rasterio",
+    "rioxarray",
+    "xarray",
+    "geopandas",
+    "shapely",
+    "pyproj",
+    "affine",
+    "zarr>=2.18,<3",
+    "numcodecs<0.16",
+    "earthengine-api",
+    "matplotlib",
+    "streamlit",
+    "folium",
+    "torch",
+    "torchvision",
+    "segmentation-models-pytorch",
+    "transformers",
+    "optuna",
+    "catboost",
+    "lightgbm",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
